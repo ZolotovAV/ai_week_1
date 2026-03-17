@@ -1,6 +1,7 @@
 "use client";
 
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import type { Dispatch, FormEvent, SetStateAction } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 type Mode = "json" | "stream";
 
@@ -11,14 +12,27 @@ type ResponseState = {
   error: string;
 };
 
+type ModelOption = {
+  id: string;
+  label: string;
+  isDefault: boolean;
+};
+
 const SERVICE_KEY_STORAGE = "nemotron-service-api-key";
 
 export function ChatConsole() {
   const [serviceKey, setServiceKey] = useState("");
+  const [availableModels, setAvailableModels] = useState<ModelOption[]>([]);
+  const [selectedModel, setSelectedModel] = useState("");
+  const [modelsError, setModelsError] = useState("");
   const [prompt, setPrompt] = useState("Write a short greeting from a web service.");
   const [systemPrompt, setSystemPrompt] = useState(
     "You are a concise assistant speaking in clear English."
   );
+  const [responseFormat, setResponseFormat] = useState("");
+  const [responseLength, setResponseLength] = useState("");
+  const [completionInstruction, setCompletionInstruction] = useState("");
+  const [stopSequence, setStopSequence] = useState("");
   const [mode, setMode] = useState<Mode>("json");
   const [reasoningEnabled, setReasoningEnabled] = useState(false);
   const [reasoningEffort, setReasoningEffort] = useState("medium");
@@ -39,13 +53,58 @@ export function ChatConsole() {
     }
   }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadModels() {
+      try {
+        const response = await fetch("/api/models");
+        const payload = (await response.json().catch(() => null)) as
+          | {
+              defaultModel?: string;
+              models?: ModelOption[];
+              error?: string;
+            }
+          | null;
+
+        if (!response.ok) {
+          throw new Error(payload?.error ?? "Failed to load model list.");
+        }
+
+        const models = payload?.models ?? [];
+        if (!cancelled) {
+          setAvailableModels(models);
+          setSelectedModel(payload?.defaultModel ?? models[0]?.id ?? "");
+          setModelsError(models.length === 0 ? "Server returned no available models." : "");
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setModelsError(
+            error instanceof Error ? error.message : "Failed to load models from the server."
+          );
+        }
+      }
+    }
+
+    void loadModels();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const requestBody = useMemo(() => {
     const numericTemperature = Number(temperature);
     const numericMaxTokens = Number(maxTokens);
 
     return {
       messages: [{ role: "user", content: prompt }],
+      model: selectedModel || undefined,
       systemPrompt,
+      responseFormat: responseFormat.trim() || undefined,
+      responseLength: responseLength.trim() || undefined,
+      completionInstruction: completionInstruction.trim() || undefined,
+      stopSequences: stopSequence.trim() ? [stopSequence.trim()] : undefined,
       temperature: Number.isFinite(numericTemperature) ? numericTemperature : undefined,
       maxTokens: Number.isFinite(numericMaxTokens) ? numericMaxTokens : undefined,
       reasoning: reasoningEnabled
@@ -55,7 +114,19 @@ export function ChatConsole() {
           }
         : undefined
     };
-  }, [maxTokens, prompt, reasoningEffort, reasoningEnabled, systemPrompt, temperature]);
+  }, [
+    completionInstruction,
+    maxTokens,
+    prompt,
+    reasoningEffort,
+    reasoningEnabled,
+    selectedModel,
+    responseFormat,
+    responseLength,
+    stopSequence,
+    systemPrompt,
+    temperature
+  ]);
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -146,43 +217,16 @@ export function ChatConsole() {
     while (true) {
       const { done, value } = await reader.read();
       if (done) {
+        flushClientSseBuffer(buffer, setResponse);
         break;
       }
 
       buffer += decoder.decode(value, { stream: true });
-      const parts = buffer.split("\n\n");
+      const parts = splitClientSseEvents(buffer);
       buffer = parts.pop() ?? "";
 
       for (const eventChunk of parts) {
-        const parsed = parseSseEvent(eventChunk);
-        if (!parsed) {
-          continue;
-        }
-
-        if (parsed.event === "meta") {
-          setResponse((current) => ({
-            ...current,
-            meta: parsed.data.model ? `Model: ${parsed.data.model}` : current.meta
-          }));
-        }
-
-        if (parsed.event === "delta") {
-          setResponse((current) => ({
-            ...current,
-            reply: current.reply + (parsed.data.content ?? "")
-          }));
-        }
-
-        if (parsed.event === "error") {
-          throw new Error(parsed.data.error ?? "Streaming upstream error.");
-        }
-
-        if (parsed.event === "done") {
-          setResponse((current) => ({
-            ...current,
-            status: "Completed"
-          }));
-        }
+        applyParsedSseEvent(eventChunk, setResponse);
       }
     }
   }
@@ -200,6 +244,7 @@ export function ChatConsole() {
           </p>
         </div>
         <div className="endpoint-card">
+          <code>GET /api/models</code>
           <code>POST /api/chat</code>
           <code>POST /api/chat/stream</code>
           <span>Auth: Bearer service key</span>
@@ -241,6 +286,81 @@ export function ChatConsole() {
               rows={8}
               required
             />
+          </label>
+
+          <label>
+            <span>OpenRouter model</span>
+            <select
+              value={selectedModel}
+              onChange={(event) => setSelectedModel(event.target.value)}
+              disabled={availableModels.length === 0}
+            >
+              {availableModels.length === 0 ? (
+                <option value="">No models available</option>
+              ) : (
+                availableModels.map((model) => (
+                  <option key={model.id} value={model.id}>
+                    {model.label}
+                    {model.isDefault ? " (default)" : ""}
+                  </option>
+                ))
+              )}
+            </select>
+            <small className="field-hint">
+              The list comes from the server allowlist. Only configured models can be used.
+            </small>
+            {modelsError ? <small className="error">{modelsError}</small> : null}
+          </label>
+
+          <label>
+            <span>Response format</span>
+            <textarea
+              className="compact-textarea"
+              value={responseFormat}
+              onChange={(event) => setResponseFormat(event.target.value)}
+              rows={3}
+              placeholder="Example: Return valid JSON with keys title, summary, and tags."
+            />
+            <small className="field-hint">
+              Adds an explicit instruction describing the required output structure.
+            </small>
+          </label>
+
+          <div className="options-row constraint-row">
+            <label>
+              <span>Length limit</span>
+              <input
+                type="text"
+                value={responseLength}
+                onChange={(event) => setResponseLength(event.target.value)}
+                placeholder="Example: No more than 60 words."
+              />
+            </label>
+
+            <label>
+              <span>Stop sequence</span>
+              <input
+                type="text"
+                value={stopSequence}
+                onChange={(event) => setStopSequence(event.target.value)}
+                placeholder="Example: END"
+              />
+            </label>
+          </div>
+
+          <label>
+            <span>Completion instruction</span>
+            <textarea
+              className="compact-textarea"
+              value={completionInstruction}
+              onChange={(event) => setCompletionInstruction(event.target.value)}
+              rows={2}
+              placeholder="Example: End the response right after the final bullet point."
+            />
+            <small className="field-hint">
+              Use this when you want an explicit finish condition in addition to or instead of a
+              stop sequence.
+            </small>
           </label>
 
           <div className="options-row">
@@ -310,7 +430,7 @@ export function ChatConsole() {
             <strong>{response.status}</strong>
             {response.meta ? <span>{response.meta}</span> : null}
           </div>
-          <pre>{response.reply || "The model response will appear here."}</pre>
+          <pre>{buildOutputText(response)}</pre>
           {response.error ? <p className="error">{response.error}</p> : null}
         </section>
       </section>
@@ -336,7 +456,7 @@ function toClientErrorMessage(error: unknown) {
 }
 
 function parseSseEvent(chunk: string) {
-  const lines = chunk.split("\n");
+  const lines = chunk.split(/\r?\n/);
   let event = "message";
   const dataLines: string[] = [];
 
@@ -362,4 +482,69 @@ function parseSseEvent(chunk: string) {
   } catch {
     return null;
   }
+}
+
+function splitClientSseEvents(buffer: string) {
+  return buffer.split(/\r?\n\r?\n/);
+}
+
+function applyParsedSseEvent(
+  eventChunk: string,
+  setResponse: Dispatch<SetStateAction<ResponseState>>
+) {
+  const parsed = parseSseEvent(eventChunk);
+  if (!parsed) {
+    return;
+  }
+
+  if (parsed.event === "meta") {
+    setResponse((current) => ({
+      ...current,
+      meta: parsed.data.model ? `Model: ${parsed.data.model}` : current.meta
+    }));
+  }
+
+  if (parsed.event === "delta") {
+    setResponse((current) => ({
+      ...current,
+      reply: current.reply + (parsed.data.content ?? "")
+    }));
+  }
+
+  if (parsed.event === "error") {
+    throw new Error(parsed.data.error ?? "Streaming upstream error.");
+  }
+
+  if (parsed.event === "done") {
+    setResponse((current) => ({
+      ...current,
+      status: "Completed"
+    }));
+  }
+}
+
+function flushClientSseBuffer(
+  buffer: string,
+  setResponse: Dispatch<SetStateAction<ResponseState>>
+) {
+  const trimmedBuffer = buffer.trim();
+  if (!trimmedBuffer) {
+    return;
+  }
+
+  for (const eventChunk of splitClientSseEvents(trimmedBuffer)) {
+    applyParsedSseEvent(eventChunk, setResponse);
+  }
+}
+
+function buildOutputText(response: ResponseState) {
+  if (response.reply) {
+    return response.reply;
+  }
+
+  if (response.status === "Completed" && !response.error) {
+    return "The model returned an empty response.";
+  }
+
+  return "The model response will appear here.";
 }

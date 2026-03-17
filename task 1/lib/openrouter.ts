@@ -1,4 +1,5 @@
 import { getServerConfig } from "@/lib/config";
+import { resolveRequestedModel } from "@/lib/models";
 import type { ChatMessage, ChatRequest } from "@/lib/types";
 
 type OpenRouterMessage = {
@@ -70,6 +71,11 @@ export async function openRouterStream(input: ChatRequest) {
 
 async function fetchOpenRouter(input: ChatRequest, stream: boolean) {
   const config = getServerConfig();
+  const resolvedModel = resolveRequestedModel(
+    input.model,
+    config.allowedModels,
+    config.defaultModel
+  );
   let response: Response;
 
   try {
@@ -82,9 +88,10 @@ async function fetchOpenRouter(input: ChatRequest, stream: boolean) {
         ...(config.appTitle ? { "X-Title": config.appTitle } : {})
       },
       body: JSON.stringify({
-        model: config.model,
+        model: resolvedModel,
         messages: buildMessages(input),
         stream,
+        ...(input.stopSequences?.length ? { stop: input.stopSequences } : {}),
         ...(typeof input.temperature === "number" ? { temperature: input.temperature } : {}),
         ...(typeof input.maxTokens === "number" ? { max_tokens: input.maxTokens } : {}),
         ...(input.reasoning?.enabled
@@ -104,7 +111,8 @@ async function fetchOpenRouter(input: ChatRequest, stream: boolean) {
   if (!response.ok) {
     const payload = (await response.json().catch(() => null)) as OpenRouterErrorPayload | null;
     const message = payload?.error?.message ?? `OpenRouter request failed with ${response.status}.`;
-    const mappedStatus = response.status === 429 ? 429 : response.status >= 500 ? 502 : 502;
+    const mappedStatus =
+      response.status === 429 ? 429 : response.status >= 500 ? 502 : response.status;
     throw new UpstreamError(mappedStatus, message, payload?.error?.metadata);
   }
 
@@ -112,17 +120,45 @@ async function fetchOpenRouter(input: ChatRequest, stream: boolean) {
 }
 
 function buildMessages(input: ChatRequest): ChatMessage[] {
-  if (!input.systemPrompt) {
+  const systemInstruction = buildSystemInstruction(input);
+
+  if (!systemInstruction) {
     return input.messages;
   }
 
   return [
     {
       role: "system",
-      content: input.systemPrompt
+      content: systemInstruction
     },
     ...input.messages
   ];
+}
+
+function buildSystemInstruction(input: ChatRequest) {
+  const instructions = [
+    input.systemPrompt?.trim(),
+    input.responseFormat?.trim()
+      ? `Return the answer in this exact format: ${input.responseFormat.trim()}`
+      : undefined,
+    input.responseLength?.trim()
+      ? `Keep the entire answer within this limit: ${input.responseLength.trim()}`
+      : undefined,
+    input.completionInstruction?.trim()
+      ? `Finish the answer when this condition is met: ${input.completionInstruction.trim()}`
+      : undefined,
+    input.stopSequences?.length
+      ? `Stop generating immediately if you are about to output any of these sequences: ${input.stopSequences
+          .map((sequence) => JSON.stringify(sequence))
+          .join(", ")}`
+      : undefined
+  ].filter((instruction): instruction is string => Boolean(instruction));
+
+  if (instructions.length === 0) {
+    return undefined;
+  }
+
+  return instructions.join("\n\n");
 }
 
 function normalizeContent(content: unknown): string {

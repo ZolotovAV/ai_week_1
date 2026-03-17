@@ -4,6 +4,7 @@
 
 В проекте есть:
 
+- `GET /api/models` для списка доступных моделей OpenRouter
 - `POST /api/chat` для обычного JSON-ответа
 - `POST /api/chat/stream` для потокового ответа через SSE
 - demo UI на `/` для ручной проверки запросов из браузера
@@ -41,6 +42,7 @@ npm install
 OPENROUTER_API_KEY=
 SERVICE_API_KEY=your_service_api_key
 OPENROUTER_MODEL=nvidia/nemotron-3-super-120b-a12b:free
+OPENROUTER_ALLOWED_MODELS=nvidia/nemotron-3-super-120b-a12b:free,openai/gpt-4o-mini,meta-llama/llama-3.3-70b-instruct
 OPENROUTER_HTTP_REFERER=http://localhost:3000
 OPENROUTER_X_TITLE=OpenRouter Nemotron Service
 ```
@@ -54,7 +56,10 @@ OPENROUTER_X_TITLE=OpenRouter Nemotron Service
   Ваш собственный ключ для доступа к API этого сервиса. Обязателен.
 
 - `OPENROUTER_MODEL`  
-  Модель OpenRouter. По умолчанию используется `nvidia/nemotron-3-super-120b-a12b:free`.
+  Модель OpenRouter по умолчанию. Используется, если клиент не передал поле `model`.
+
+- `OPENROUTER_ALLOWED_MODELS`  
+  Список разрешённых моделей через запятую. UI получает этот список с сервера и позволяет выбирать только эти модели.
 
 - `OPENROUTER_HTTP_REFERER`  
   Необязательный заголовок для OpenRouter. Для локальной разработки можно оставить `http://localhost:3000`.
@@ -112,11 +117,13 @@ http://localhost:3000
 1. Вставьте значение `SERVICE_API_KEY` в поле `Service API key`.
 2. Заполните `System prompt` при необходимости.
 3. Введите пользовательский запрос в `User prompt`.
-4. Выберите режим:
+4. Выберите `OpenRouter model` из серверного списка разрешённых моделей.
+5. При необходимости задайте `Response format`, `Length limit`, `Stop sequence` и `Completion instruction`.
+6. Выберите режим:
    - `JSON`
    - `Stream (SSE)`
-5. При необходимости включите `Enable reasoning`.
-6. Нажмите `Send request`.
+7. При необходимости включите `Enable reasoning`.
+8. Нажмите `Send request`.
 
 Если получите `401 Unauthorized`, это означает, что ключ в форме не совпадает со значением `SERVICE_API_KEY` в `.env.local`.
 
@@ -136,6 +143,30 @@ Authorization: Bearer <SERVICE_API_KEY>
 Content-Type: application/json
 ```
 
+### GET /api/models
+
+Возвращает список моделей, которые разрешено выбирать из UI и отправлять через API.
+
+Пример ответа:
+
+```json
+{
+  "defaultModel": "nvidia/nemotron-3-super-120b-a12b:free",
+  "models": [
+    {
+      "id": "nvidia/nemotron-3-super-120b-a12b:free",
+      "label": "nvidia/nemotron-3-super-120b-a12b:free",
+      "isDefault": true
+    },
+    {
+      "id": "openai/gpt-4o-mini",
+      "label": "openai/gpt-4o-mini",
+      "isDefault": false
+    }
+  ]
+}
+```
+
 ### POST /api/chat
 
 Возвращает обычный JSON-ответ.
@@ -150,6 +181,7 @@ Content-Type: application/json
 
 ```json
 {
+  "model": "openai/gpt-4o-mini",
   "messages": [
     {
       "role": "user",
@@ -217,7 +249,12 @@ data: {"done":true}
 Поддерживаемые поля:
 
 - `messages` — обязательный массив сообщений
+- `model` — необязательный id модели OpenRouter из серверного allowlist
 - `systemPrompt` — необязательный system prompt
+- `responseFormat` — необязательное явное описание формата ответа
+- `responseLength` — необязательное ограничение на длину ответа
+- `stopSequences` — необязательный массив stop sequence для upstream-запроса
+- `completionInstruction` — необязательная явная инструкция, когда завершить ответ
 - `temperature` — необязательное число от `0` до `2`
 - `maxTokens` — необязательное целое число от `1` до `4096`
 - `reasoning.enabled` — необязательный флаг
@@ -237,6 +274,102 @@ data: {"done":true}
 - `system`
 - `user`
 - `assistant`
+
+## Один и тот же запрос с разными ограничениями
+
+Ниже один и тот же пользовательский запрос:
+
+```json
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": "Tell me about the benefits of server-side API keys."
+    }
+  ],
+  "model": "nvidia/nemotron-3-super-120b-a12b:free"
+}
+```
+
+### 1. Явно задать формат ответа
+
+```json
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": "Tell me about the benefits of server-side API keys."
+    }
+  ],
+  "model": "nvidia/nemotron-3-super-120b-a12b:free",
+  "responseFormat": "Return Markdown with exactly three bullet points. Each bullet must contain a short title, a colon, and one sentence."
+}
+```
+
+### 2. Добавить ограничение на длину ответа
+
+```json
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": "Tell me about the benefits of server-side API keys."
+    }
+  ],
+  "model": "nvidia/nemotron-3-super-120b-a12b:free",
+  "responseLength": "No more than 45 words total."
+}
+```
+
+### 3. Добавить условие завершения ответа
+
+Вариант со `stop sequence`:
+
+```json
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": "Tell me about the benefits of server-side API keys."
+    }
+  ],
+  "model": "nvidia/nemotron-3-super-120b-a12b:free",
+  "stopSequences": ["<END>"]
+}
+```
+
+Вариант с явной инструкцией:
+
+```json
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": "Tell me about the benefits of server-side API keys."
+    }
+  ],
+  "model": "nvidia/nemotron-3-super-120b-a12b:free",
+  "completionInstruction": "End the response immediately after the third bullet point."
+}
+```
+
+Можно комбинировать эти поля в одном запросе:
+
+```json
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": "Tell me about the benefits of server-side API keys."
+    }
+  ],
+  "model": "nvidia/nemotron-3-super-120b-a12b:free",
+  "responseFormat": "Return Markdown with exactly three bullet points.",
+  "responseLength": "No more than 45 words total.",
+  "stopSequences": ["<END>"],
+  "completionInstruction": "End the response immediately after the third bullet point."
+}
+```
 
 ## Примеры вызова
 

@@ -1,6 +1,7 @@
 import { isAuthorized } from "@/lib/auth";
 import { getServerConfig } from "@/lib/config";
 import { jsonError, sseEvent } from "@/lib/http";
+import { ModelSelectionError, resolveRequestedModel } from "@/lib/models";
 import { openRouterStream, UpstreamError } from "@/lib/openrouter";
 import { chatRequestSchema } from "@/lib/types";
 
@@ -32,6 +33,23 @@ export async function POST(request: Request) {
     return jsonError(400, "Invalid request payload.", parsed.error.flatten());
   }
 
+  let selectedModel: string;
+
+  try {
+    selectedModel = resolveRequestedModel(
+      parsed.data.model,
+      config.allowedModels,
+      config.defaultModel
+    );
+    parsed.data.model = selectedModel;
+  } catch (error) {
+    if (error instanceof ModelSelectionError) {
+      return jsonError(400, error.message);
+    }
+
+    return jsonError(400, "Invalid model selection.");
+  }
+
   try {
     const upstreamResponse = await openRouterStream(parsed.data);
     const encoder = new TextEncoder();
@@ -44,7 +62,7 @@ export async function POST(request: Request) {
         controller.enqueue(
           encoder.encode(
             sseEvent("meta", {
-              model: config.model,
+              model: selectedModel,
               provider: "openrouter"
             })
           )
@@ -63,39 +81,28 @@ export async function POST(request: Request) {
           while (true) {
             const { done, value } = await reader.read();
             if (done) {
+              flushBufferedEvents(buffer, controller, encoder);
               break;
             }
 
             buffer += decoder.decode(value, { stream: true });
-            const events = buffer.split("\n\n");
+            const events = splitSseEvents(buffer);
             buffer = events.pop() ?? "";
 
             for (const rawEvent of events) {
-              const payloadLine = rawEvent
-                .split("\n")
-                .find((line) => line.startsWith("data:"));
-
-              if (!payloadLine) {
+              const parsed = parseUpstreamEvent(rawEvent);
+              if (!parsed) {
                 continue;
               }
 
-              const data = payloadLine.slice(5).trim();
-              if (data === "[DONE]") {
+              if (parsed.done) {
                 controller.enqueue(encoder.encode(sseEvent("done", { done: true })));
                 controller.close();
                 return;
               }
 
-              let parsedEvent: Record<string, unknown>;
-              try {
-                parsedEvent = JSON.parse(data) as Record<string, unknown>;
-              } catch {
-                continue;
-              }
-
-              const content = extractDelta(parsedEvent);
-              if (content) {
-                controller.enqueue(encoder.encode(sseEvent("delta", { content })));
+              if (parsed.content) {
+                controller.enqueue(encoder.encode(sseEvent("delta", { content: parsed.content })));
               }
             }
           }
@@ -129,10 +136,60 @@ export async function POST(request: Request) {
   }
 }
 
+function splitSseEvents(buffer: string) {
+  return buffer.split(/\r?\n\r?\n/);
+}
+
+function flushBufferedEvents(
+  buffer: string,
+  controller: ReadableStreamDefaultController<Uint8Array>,
+  encoder: TextEncoder
+) {
+  const trimmedBuffer = buffer.trim();
+  if (!trimmedBuffer) {
+    return;
+  }
+
+  for (const rawEvent of splitSseEvents(trimmedBuffer)) {
+    const parsed = parseUpstreamEvent(rawEvent);
+    if (parsed?.content) {
+      controller.enqueue(encoder.encode(sseEvent("delta", { content: parsed.content })));
+    }
+  }
+}
+
+function parseUpstreamEvent(rawEvent: string) {
+  const dataLines = rawEvent
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith("data:"))
+    .map((line) => line.slice(5).trim());
+
+  if (dataLines.length === 0) {
+    return null;
+  }
+
+  const data = dataLines.join("\n");
+  if (data === "[DONE]") {
+    return { done: true, content: "" };
+  }
+
+  let parsedEvent: Record<string, unknown>;
+  try {
+    parsedEvent = JSON.parse(data) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+
+  return {
+    done: false,
+    content: extractDelta(parsedEvent)
+  };
+}
+
 function extractDelta(event: Record<string, unknown>) {
   const choices = event.choices;
   if (!Array.isArray(choices)) {
-    return "";
+    return extractMessageContent(event);
   }
 
   const firstChoice = choices[0];
@@ -141,10 +198,48 @@ function extractDelta(event: Record<string, unknown>) {
   }
 
   const delta = (firstChoice as { delta?: unknown }).delta;
-  if (!delta || typeof delta !== "object") {
+  if (delta && typeof delta === "object") {
+    const deltaContent = extractMessageContent(delta as Record<string, unknown>);
+    if (deltaContent) {
+      return deltaContent;
+    }
+  }
+
+  const message = (firstChoice as { message?: unknown }).message;
+  if (message && typeof message === "object") {
+    return extractMessageContent(message as Record<string, unknown>);
+  }
+
+  return "";
+}
+
+function extractMessageContent(value: Record<string, unknown>) {
+  const content = value.content;
+
+  if (typeof content === "string") {
+    return content;
+  }
+
+  if (!Array.isArray(content)) {
     return "";
   }
 
-  const content = (delta as { content?: unknown }).content;
-  return typeof content === "string" ? content : "";
+  return content
+    .flatMap((part) => {
+      if (typeof part === "string") {
+        return [part];
+      }
+
+      if (
+        part &&
+        typeof part === "object" &&
+        "text" in part &&
+        typeof (part as { text?: unknown }).text === "string"
+      ) {
+        return [(part as { text: string }).text];
+      }
+
+      return [];
+    })
+    .join("");
 }
