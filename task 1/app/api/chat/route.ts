@@ -52,9 +52,15 @@ export async function POST(request: Request) {
     return Response.json(completion);
   } catch (error) {
     if (error instanceof UpstreamError) {
+      console.error("POST /api/chat upstream error", {
+        details: error.details,
+        message: error.message,
+        status: error.status
+      });
       return jsonError(error.status, error.message, error.details);
     }
 
+    console.error("POST /api/chat unexpected error", error);
     return jsonError(500, "Unexpected server error.");
   }
 }

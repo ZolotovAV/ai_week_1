@@ -1,7 +1,7 @@
 "use client";
 
 import type { Dispatch, FormEvent, SetStateAction } from "react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 
 type Mode = "json" | "stream";
 
@@ -16,6 +16,34 @@ type ModelOption = {
   id: string;
   label: string;
   isDefault: boolean;
+};
+
+type ApiErrorPayload = {
+  details?: unknown;
+  error?: string;
+};
+
+type ConversationMessage = {
+  content: string;
+  role: "assistant" | "user";
+};
+
+type ChatRequestPayload = {
+  completionInstruction?: string;
+  maxTokens?: number;
+  messages: ConversationMessage[];
+  model?: string;
+  reasoning?:
+    | {
+        enabled: true;
+        effort: string;
+      }
+    | undefined;
+  responseFormat?: string;
+  responseLength?: string;
+  stopSequences?: string[];
+  systemPrompt?: string;
+  temperature?: number;
 };
 
 const SERVICE_KEY_STORAGE = "nemotron-service-api-key";
@@ -38,6 +66,7 @@ export function ChatConsole() {
   const [reasoningEffort, setReasoningEffort] = useState("medium");
   const [temperature, setTemperature] = useState("0.7");
   const [maxTokens, setMaxTokens] = useState("512");
+  const [conversationHistory, setConversationHistory] = useState<ConversationMessage[]>([]);
   const [loading, setLoading] = useState(false);
   const [response, setResponse] = useState<ResponseState>({
     reply: "",
@@ -93,44 +122,10 @@ export function ChatConsole() {
     };
   }, []);
 
-  const requestBody = useMemo(() => {
-    const numericTemperature = Number(temperature);
-    const numericMaxTokens = Number(maxTokens);
-
-    return {
-      messages: [{ role: "user", content: prompt }],
-      model: selectedModel || undefined,
-      systemPrompt,
-      responseFormat: responseFormat.trim() || undefined,
-      responseLength: responseLength.trim() || undefined,
-      completionInstruction: completionInstruction.trim() || undefined,
-      stopSequences: stopSequence.trim() ? [stopSequence.trim()] : undefined,
-      temperature: Number.isFinite(numericTemperature) ? numericTemperature : undefined,
-      maxTokens: Number.isFinite(numericMaxTokens) ? numericMaxTokens : undefined,
-      reasoning: reasoningEnabled
-        ? {
-            enabled: true,
-            effort: reasoningEffort
-          }
-        : undefined
-    };
-  }, [
-    completionInstruction,
-    maxTokens,
-    prompt,
-    reasoningEffort,
-    reasoningEnabled,
-    selectedModel,
-    responseFormat,
-    responseLength,
-    stopSequence,
-    systemPrompt,
-    temperature
-  ]);
-
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const normalizedServiceKey = serviceKey.trim();
+    const normalizedPrompt = prompt.trim();
 
     if (!normalizedServiceKey) {
       setResponse({
@@ -141,6 +136,31 @@ export function ChatConsole() {
       });
       return;
     }
+
+    if (!normalizedPrompt) {
+      setResponse({
+        reply: "",
+        status: "Failed",
+        meta: "",
+        error: "Enter a user prompt before sending a request."
+      });
+      return;
+    }
+
+    const requestBody = buildRequestBody({
+      completionInstruction,
+      conversationHistory,
+      maxTokens,
+      prompt: normalizedPrompt,
+      reasoningEffort,
+      reasoningEnabled,
+      responseFormat,
+      responseLength,
+      selectedModel,
+      stopSequence,
+      systemPrompt,
+      temperature
+    });
 
     setLoading(true);
     setResponse({
@@ -154,9 +174,9 @@ export function ChatConsole() {
 
     try {
       if (mode === "json") {
-        await submitJson(normalizedServiceKey);
+        await submitJson(normalizedServiceKey, normalizedPrompt, requestBody);
       } else {
-        await submitStream(normalizedServiceKey);
+        await submitStream(normalizedServiceKey, normalizedPrompt, requestBody);
       }
     } catch (error) {
       const message = toClientErrorMessage(error);
@@ -170,7 +190,21 @@ export function ChatConsole() {
     }
   }
 
-  async function submitJson(serviceKey: string) {
+  function handleClearContext() {
+    setConversationHistory([]);
+    setResponse({
+      reply: "",
+      status: "Idle",
+      meta: "",
+      error: ""
+    });
+  }
+
+  async function submitJson(
+    serviceKey: string,
+    submittedPrompt: string,
+    requestBody: ChatRequestPayload
+  ) {
     const apiResponse = await fetch("/api/chat", {
       method: "POST",
       headers: buildHeaders(serviceKey),
@@ -183,13 +217,17 @@ export function ChatConsole() {
           model?: string;
           usage?: Record<string, unknown>;
           error?: string;
+          details?: unknown;
         }
       | null;
 
     if (!apiResponse.ok) {
-      throw new Error(payload?.error ?? `Request failed with status ${apiResponse.status}.`);
+      throw new Error(formatApiError(apiResponse.status, payload));
     }
 
+    setConversationHistory((current) =>
+      appendConversationTurn(current, submittedPrompt, payload?.reply ?? "")
+    );
     setResponse({
       reply: payload?.reply ?? "",
       status: "Completed",
@@ -198,7 +236,11 @@ export function ChatConsole() {
     });
   }
 
-  async function submitStream(serviceKey: string) {
+  async function submitStream(
+    serviceKey: string,
+    submittedPrompt: string,
+    requestBody: ChatRequestPayload
+  ) {
     const apiResponse = await fetch("/api/chat/stream", {
       method: "POST",
       headers: buildHeaders(serviceKey),
@@ -206,18 +248,21 @@ export function ChatConsole() {
     });
 
     if (!apiResponse.ok || !apiResponse.body) {
-      const payload = (await apiResponse.json().catch(() => null)) as { error?: string } | null;
-      throw new Error(payload?.error ?? `Streaming failed with status ${apiResponse.status}.`);
+      const payload = (await apiResponse.json().catch(() => null)) as ApiErrorPayload | null;
+      throw new Error(formatApiError(apiResponse.status, payload));
     }
 
     const reader = apiResponse.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
+    let assistantReply = "";
 
     while (true) {
       const { done, value } = await reader.read();
       if (done) {
-        flushClientSseBuffer(buffer, setResponse);
+        flushClientSseBuffer(buffer, setResponse, (content) => {
+          assistantReply += content;
+        });
         break;
       }
 
@@ -226,9 +271,15 @@ export function ChatConsole() {
       buffer = parts.pop() ?? "";
 
       for (const eventChunk of parts) {
-        applyParsedSseEvent(eventChunk, setResponse);
+        applyParsedSseEvent(eventChunk, setResponse, (content) => {
+          assistantReply += content;
+        });
       }
     }
+
+    setConversationHistory((current) =>
+      appendConversationTurn(current, submittedPrompt, assistantReply)
+    );
   }
 
   return (
@@ -251,128 +302,95 @@ export function ChatConsole() {
         </div>
       </section>
 
-      <section className="grid">
-        <form className="panel form-panel" onSubmit={handleSubmit}>
-          <label>
-            <span>Service API key</span>
-            <input
-              autoComplete="off"
-              type="password"
-              value={serviceKey}
-              onChange={(event) => setServiceKey(event.target.value)}
-              placeholder="Bearer token for this service"
-              required
-            />
-            <small className="field-hint">
-              Use the exact <code>SERVICE_API_KEY</code> value from <code>.env.local</code>. If
-              you changed it, restart <code>npm run dev</code>.
-            </small>
-          </label>
-
-          <label>
-            <span>System prompt</span>
-            <textarea
-              value={systemPrompt}
-              onChange={(event) => setSystemPrompt(event.target.value)}
-              rows={3}
-            />
-          </label>
-
-          <label>
-            <span>User prompt</span>
-            <textarea
-              value={prompt}
-              onChange={(event) => setPrompt(event.target.value)}
-              rows={8}
-              required
-            />
-          </label>
-
-          <label>
-            <span>OpenRouter model</span>
-            <select
-              value={selectedModel}
-              onChange={(event) => setSelectedModel(event.target.value)}
-              disabled={availableModels.length === 0}
-            >
-              {availableModels.length === 0 ? (
-                <option value="">No models available</option>
-              ) : (
-                availableModels.map((model) => (
-                  <option key={model.id} value={model.id}>
-                    {model.label}
-                    {model.isDefault ? " (default)" : ""}
-                  </option>
-                ))
-              )}
-            </select>
-            <small className="field-hint">
-              The list comes from the server allowlist. Only configured models can be used.
-            </small>
-            {modelsError ? <small className="error">{modelsError}</small> : null}
-          </label>
-
-          <label>
-            <span>Response format</span>
-            <textarea
-              className="compact-textarea"
-              value={responseFormat}
-              onChange={(event) => setResponseFormat(event.target.value)}
-              rows={3}
-              placeholder="Example: Return valid JSON with keys title, summary, and tags."
-            />
-            <small className="field-hint">
-              Adds an explicit instruction describing the required output structure.
-            </small>
-          </label>
-
-          <div className="options-row constraint-row">
-            <label>
-              <span>Length limit</span>
+      <section className="workspace">
+        <form className="panel controls-panel" onSubmit={handleSubmit}>
+          <div className="control-row control-row-primary">
+            <label className="field-card field-span-2">
+              <span>Service API key</span>
               <input
-                type="text"
-                value={responseLength}
-                onChange={(event) => setResponseLength(event.target.value)}
-                placeholder="Example: No more than 60 words."
+                autoComplete="off"
+                type="password"
+                value={serviceKey}
+                onChange={(event) => setServiceKey(event.target.value)}
+                placeholder="Bearer token for this service"
+                required
               />
+              <small className="field-hint">
+                Use the exact <code>SERVICE_API_KEY</code> value from <code>.env.local</code>. If
+                you changed it, restart <code>npm run dev</code>.
+              </small>
             </label>
 
-            <label>
-              <span>Stop sequence</span>
-              <input
-                type="text"
-                value={stopSequence}
-                onChange={(event) => setStopSequence(event.target.value)}
-                placeholder="Example: END"
-              />
+            <label className="field-card field-span-2">
+              <span>OpenRouter model</span>
+              <select
+                value={selectedModel}
+                onChange={(event) => setSelectedModel(event.target.value)}
+                disabled={availableModels.length === 0}
+              >
+                {availableModels.length === 0 ? (
+                  <option value="">No models available</option>
+                ) : (
+                  availableModels.map((model) => (
+                    <option key={model.id} value={model.id}>
+                      {model.label}
+                      {model.isDefault ? " (default)" : ""}
+                    </option>
+                  ))
+                )}
+              </select>
+              <small className="field-hint">
+                The list comes from the server allowlist. Only configured models can be used.
+              </small>
+              {modelsError ? <small className="error">{modelsError}</small> : null}
             </label>
-          </div>
 
-          <label>
-            <span>Completion instruction</span>
-            <textarea
-              className="compact-textarea"
-              value={completionInstruction}
-              onChange={(event) => setCompletionInstruction(event.target.value)}
-              rows={2}
-              placeholder="Example: End the response right after the final bullet point."
-            />
-            <small className="field-hint">
-              Use this when you want an explicit finish condition in addition to or instead of a
-              stop sequence.
-            </small>
-          </label>
-
-          <div className="options-row">
-            <label>
+            <label className="field-card">
               <span>Mode</span>
               <select value={mode} onChange={(event) => setMode(event.target.value as Mode)}>
                 <option value="json">JSON</option>
                 <option value="stream">Stream (SSE)</option>
               </select>
             </label>
+          </div>
 
-            <label>
+          <div className="control-row control-row-secondary">
+            <label className="field-card field-span-2">
+              <span>System prompt</span>
+              <textarea
+                value={systemPrompt}
+                onChange={(event) => setSystemPrompt(event.target.value)}
+                rows={4}
+              />
+            </label>
+
+            <label className="field-card field-span-2">
+              <span>User prompt</span>
+              <textarea
+                value={prompt}
+                onChange={(event) => setPrompt(event.target.value)}
+                rows={4}
+                required
+              />
+            </label>
+
+            <label className="field-card">
+              <span>Response format</span>
+              <textarea
+                className="compact-textarea"
+                value={responseFormat}
+                onChange={(event) => setResponseFormat(event.target.value)}
+                rows={4}
+                placeholder="Example: Return valid JSON with keys title, summary, and tags."
+              />
+              <small className="field-hint">
+                Adds an explicit instruction describing the required output structure.
+              </small>
+            </label>
+          </div>
+
+          <div className="control-row control-row-tertiary">
+            <label className="field-card">
               <span>Temperature</span>
               <input
                 type="number"
@@ -384,7 +402,7 @@ export function ChatConsole() {
               />
             </label>
 
-            <label>
+            <label className="field-card">
               <span>Max tokens</span>
               <input
                 type="number"
@@ -394,19 +412,55 @@ export function ChatConsole() {
                 onChange={(event) => setMaxTokens(event.target.value)}
               />
             </label>
-          </div>
 
-          <div className="options-row reasoning-row">
-            <label className="toggle">
+            <label className="field-card">
+              <span>Length limit</span>
               <input
-                type="checkbox"
-                checked={reasoningEnabled}
-                onChange={(event) => setReasoningEnabled(event.target.checked)}
+                type="text"
+                value={responseLength}
+                onChange={(event) => setResponseLength(event.target.value)}
+                placeholder="Example: No more than 60 words."
               />
-              <span>Enable reasoning</span>
             </label>
 
-            <label>
+            <label className="field-card">
+              <span>Stop sequence</span>
+              <input
+                type="text"
+                value={stopSequence}
+                onChange={(event) => setStopSequence(event.target.value)}
+                placeholder="Example: END"
+              />
+            </label>
+
+            <label className="field-card field-span-2">
+              <span>Completion instruction</span>
+              <textarea
+                className="compact-textarea"
+                value={completionInstruction}
+                onChange={(event) => setCompletionInstruction(event.target.value)}
+                rows={3}
+                placeholder="Example: End the response right after the final bullet point."
+              />
+              <small className="field-hint">
+                Use this when you want an explicit finish condition in addition to or instead of a
+                stop sequence.
+              </small>
+            </label>
+
+            <div className="field-card toggle-card">
+              <span>Reasoning</span>
+              <label className="toggle">
+                <input
+                  type="checkbox"
+                  checked={reasoningEnabled}
+                  onChange={(event) => setReasoningEnabled(event.target.checked)}
+                />
+                <span>Enable reasoning</span>
+              </label>
+            </div>
+
+            <label className="field-card">
               <span>Reasoning effort</span>
               <select
                 value={reasoningEffort}
@@ -418,11 +472,24 @@ export function ChatConsole() {
                 <option value="high">high</option>
               </select>
             </label>
-          </div>
 
-          <button type="submit" disabled={loading}>
-            {loading ? "Working..." : "Send request"}
-          </button>
+            <div className="action-card">
+              <button type="submit" disabled={loading}>
+                {loading ? "Working..." : "Send request"}
+              </button>
+              <button
+                className="secondary-action"
+                type="button"
+                onClick={handleClearContext}
+                disabled={loading || conversationHistory.length === 0}
+              >
+                Clear context
+              </button>
+              <small className="field-hint">
+                Context messages: {conversationHistory.length}
+              </small>
+            </div>
+          </div>
         </form>
 
         <section className="panel output-panel">
@@ -430,7 +497,7 @@ export function ChatConsole() {
             <strong>{response.status}</strong>
             {response.meta ? <span>{response.meta}</span> : null}
           </div>
-          <pre>{buildOutputText(response)}</pre>
+          <div className="output-content">{buildOutputText(response)}</div>
           {response.error ? <p className="error">{response.error}</p> : null}
         </section>
       </section>
@@ -448,11 +515,42 @@ function buildHeaders(serviceKey: string) {
 function toClientErrorMessage(error: unknown) {
   const message = error instanceof Error ? error.message : "Unexpected client error.";
 
-  if (message === "Unauthorized.") {
+  if (message.startsWith("Unauthorized.")) {
     return "401 Unauthorized: the key in the form does not match SERVICE_API_KEY from .env.local.";
   }
 
   return message;
+}
+
+function formatApiError(status: number, payload: ApiErrorPayload | null) {
+  const message = payload?.error ?? `Request failed with status ${status}.`;
+  const details = formatErrorDetails(payload?.details);
+
+  return details ? `${message} Details: ${details}` : message;
+}
+
+function formatErrorDetails(details: unknown) {
+  if (typeof details === "string") {
+    return details;
+  }
+
+  if (!details || typeof details !== "object") {
+    return "";
+  }
+
+  return Object.entries(details as Record<string, unknown>)
+    .flatMap(([key, value]) => {
+      if (value === undefined || value === null || value === "") {
+        return [];
+      }
+
+      if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+        return [`${key}: ${String(value)}`];
+      }
+
+      return [`${key}: ${JSON.stringify(value)}`];
+    })
+    .join("; ");
 }
 
 function parseSseEvent(chunk: string) {
@@ -490,7 +588,8 @@ function splitClientSseEvents(buffer: string) {
 
 function applyParsedSseEvent(
   eventChunk: string,
-  setResponse: Dispatch<SetStateAction<ResponseState>>
+  setResponse: Dispatch<SetStateAction<ResponseState>>,
+  onDelta?: (content: string) => void
 ) {
   const parsed = parseSseEvent(eventChunk);
   if (!parsed) {
@@ -505,9 +604,11 @@ function applyParsedSseEvent(
   }
 
   if (parsed.event === "delta") {
+    const content = parsed.data.content ?? "";
+    onDelta?.(content);
     setResponse((current) => ({
       ...current,
-      reply: current.reply + (parsed.data.content ?? "")
+      reply: current.reply + content
     }));
   }
 
@@ -525,7 +626,8 @@ function applyParsedSseEvent(
 
 function flushClientSseBuffer(
   buffer: string,
-  setResponse: Dispatch<SetStateAction<ResponseState>>
+  setResponse: Dispatch<SetStateAction<ResponseState>>,
+  onDelta?: (content: string) => void
 ) {
   const trimmedBuffer = buffer.trim();
   if (!trimmedBuffer) {
@@ -533,8 +635,58 @@ function flushClientSseBuffer(
   }
 
   for (const eventChunk of splitClientSseEvents(trimmedBuffer)) {
-    applyParsedSseEvent(eventChunk, setResponse);
+    applyParsedSseEvent(eventChunk, setResponse, onDelta);
   }
+}
+
+function appendConversationTurn(
+  history: ConversationMessage[],
+  userPrompt: string,
+  assistantReply: string
+) {
+  const nextHistory: ConversationMessage[] = [...history, { role: "user", content: userPrompt }];
+
+  if (assistantReply.trim()) {
+    nextHistory.push({ role: "assistant", content: assistantReply });
+  }
+
+  return nextHistory;
+}
+
+function buildRequestBody(input: {
+  completionInstruction: string;
+  conversationHistory: ConversationMessage[];
+  maxTokens: string;
+  prompt: string;
+  reasoningEffort: string;
+  reasoningEnabled: boolean;
+  responseFormat: string;
+  responseLength: string;
+  selectedModel: string;
+  stopSequence: string;
+  systemPrompt: string;
+  temperature: string;
+}): ChatRequestPayload {
+  const numericTemperature = Number(input.temperature);
+  const numericMaxTokens = Number(input.maxTokens);
+
+  return {
+    messages: [...input.conversationHistory, { role: "user", content: input.prompt }],
+    model: input.selectedModel || undefined,
+    systemPrompt: input.systemPrompt.trim() || undefined,
+    responseFormat: input.responseFormat.trim() || undefined,
+    responseLength: input.responseLength.trim() || undefined,
+    completionInstruction: input.completionInstruction.trim() || undefined,
+    stopSequences: input.stopSequence.trim() ? [input.stopSequence.trim()] : undefined,
+    temperature: Number.isFinite(numericTemperature) ? numericTemperature : undefined,
+    maxTokens: Number.isFinite(numericMaxTokens) ? numericMaxTokens : undefined,
+    reasoning: input.reasoningEnabled
+      ? {
+          enabled: true,
+          effort: input.reasoningEffort
+        }
+      : undefined
+  };
 }
 
 function buildOutputText(response: ResponseState) {

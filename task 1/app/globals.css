@@ -45,7 +45,7 @@ textarea {
 }
 
 .shell {
-  max-width: 1240px;
+  max-width: 1380px;
   margin: 0 auto;
   padding: 48px 20px 64px;
 }
@@ -103,31 +103,53 @@ textarea {
   color: var(--muted);
 }
 
-.grid {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 0.9fr);
-  gap: 24px;
-}
-
 .panel {
   border-radius: 28px;
   padding: 24px;
 }
 
-.form-panel {
+.workspace {
   display: grid;
-  gap: 18px;
+  gap: 24px;
 }
 
-.form-panel label {
+.controls-panel {
+  display: grid;
+  gap: 16px;
+}
+
+.control-row {
+  display: grid;
+  gap: 16px;
+  align-items: stretch;
+}
+
+.control-row-primary,
+.control-row-secondary {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+
+.control-row-tertiary {
+  grid-template-columns: repeat(9, minmax(0, 1fr));
+}
+
+.field-card,
+.action-card {
   display: grid;
   gap: 8px;
   color: var(--muted);
+  min-width: 0;
+  align-content: start;
 }
 
-.form-panel span {
+.field-card > span,
+.toggle-card > span {
   font-family: var(--mono);
   font-size: 0.88rem;
+}
+
+.field-span-2 {
+  grid-column: span 2;
 }
 
 .field-hint {
@@ -136,9 +158,9 @@ textarea {
   line-height: 1.5;
 }
 
-.form-panel input,
-.form-panel textarea,
-.form-panel select {
+.controls-panel input,
+.controls-panel textarea,
+.controls-panel select {
   width: 100%;
   padding: 12px 14px;
   border: 1px solid rgba(113, 85, 39, 0.22);
@@ -147,35 +169,26 @@ textarea {
   color: var(--text);
 }
 
-.form-panel textarea {
+.controls-panel input,
+.controls-panel select {
+  min-height: 52px;
+}
+
+.controls-panel textarea {
   resize: vertical;
-  min-height: 120px;
+  min-height: 108px;
 }
 
-.form-panel textarea.compact-textarea {
-  min-height: 88px;
-}
-
-.options-row {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 14px;
-}
-
-.constraint-row {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-}
-
-.reasoning-row {
-  grid-template-columns: minmax(0, 1fr) 200px;
-  align-items: end;
+.controls-panel textarea.compact-textarea {
+  min-height: 96px;
 }
 
 .toggle {
   display: flex;
   align-items: center;
   gap: 10px;
-  min-height: 48px;
+  min-height: 52px;
+  padding: 0 2px;
 }
 
 .toggle input {
@@ -183,7 +196,16 @@ textarea {
   height: 18px;
 }
 
-.form-panel button {
+.toggle-card {
+  justify-content: center;
+}
+
+.action-card {
+  align-content: end;
+}
+
+.controls-panel button {
+  width: 100%;
   min-height: 54px;
   padding: 0 20px;
   border: 0;
@@ -194,11 +216,17 @@ textarea {
   transition: transform 160ms ease, opacity 160ms ease;
 }
 
-.form-panel button:hover:not(:disabled) {
+.controls-panel button.secondary-action {
+  border: 1px solid rgba(123, 47, 18, 0.22);
+  background: rgba(252, 246, 234, 0.9);
+  color: var(--accent-strong);
+}
+
+.controls-panel button:hover:not(:disabled) {
   transform: translateY(-1px);
 }
 
-.form-panel button:disabled {
+.controls-panel button:disabled {
   opacity: 0.68;
   cursor: default;
 }
@@ -207,6 +235,7 @@ textarea {
   display: grid;
   gap: 16px;
   align-content: start;
+  min-width: 0;
 }
 
 .status-line {
@@ -218,7 +247,7 @@ textarea {
   color: var(--muted);
 }
 
-.output-panel pre {
+.output-content {
   margin: 0;
   min-height: 420px;
   padding: 18px;
@@ -241,17 +270,22 @@ textarea {
 
 @media (max-width: 960px) {
   .hero,
-  .grid,
-  .options-row,
-  .reasoning-row {
+  .control-row,
+  .control-row-primary,
+  .control-row-secondary,
+  .control-row-tertiary {
     grid-template-columns: 1fr;
+  }
+
+  .field-span-2 {
+    grid-column: auto;
   }
 
   .shell {
     padding-inline: 16px;
   }
 
-  .output-panel pre {
+  .output-content {
     min-height: 280px;
   }
 }

@@ -25,6 +25,11 @@ type OpenRouterErrorPayload = {
   };
 };
 
+type ParsedOpenRouterError = {
+  details?: Record<string, unknown>;
+  message: string;
+};
+
 export class UpstreamError extends Error {
   status: number;
   details?: unknown;
@@ -109,11 +114,10 @@ async function fetchOpenRouter(input: ChatRequest, stream: boolean) {
   }
 
   if (!response.ok) {
-    const payload = (await response.json().catch(() => null)) as OpenRouterErrorPayload | null;
-    const message = payload?.error?.message ?? `OpenRouter request failed with ${response.status}.`;
+    const { details, message } = await parseOpenRouterError(response);
     const mappedStatus =
       response.status === 429 ? 429 : response.status >= 500 ? 502 : response.status;
-    throw new UpstreamError(mappedStatus, message, payload?.error?.metadata);
+    throw new UpstreamError(mappedStatus, message, details);
   }
 
   return response;
@@ -218,4 +222,46 @@ function mapUnexpectedUpstreamError(error: unknown) {
   }
 
   return new UpstreamError(502, "Unexpected upstream failure.");
+}
+
+async function parseOpenRouterError(response: Response): Promise<ParsedOpenRouterError> {
+  const responseText = await response.text();
+  const trimmedText = responseText.trim();
+  const baseDetails: Record<string, unknown> = {
+    upstreamStatus: response.status,
+    upstreamStatusText: response.statusText
+  };
+
+  if (!trimmedText) {
+    return {
+      message: `OpenRouter request failed with ${response.status}.`,
+      details: baseDetails
+    };
+  }
+
+  try {
+    const payload = JSON.parse(trimmedText) as OpenRouterErrorPayload;
+    return {
+      message: payload.error?.message ?? `OpenRouter request failed with ${response.status}.`,
+      details: {
+        ...baseDetails,
+        ...(payload.error?.metadata &&
+        typeof payload.error.metadata === "object" &&
+        !Array.isArray(payload.error.metadata)
+          ? (payload.error.metadata as Record<string, unknown>)
+          : payload.error?.metadata !== undefined
+            ? { metadata: payload.error.metadata }
+            : {}),
+        ...(payload.error?.code !== undefined ? { upstreamCode: payload.error.code } : {})
+      }
+    };
+  } catch {
+    return {
+      message: `OpenRouter request failed with ${response.status}.`,
+      details: {
+        ...baseDetails,
+        upstreamBody: trimmedText
+      }
+    };
+  }
 }

@@ -129,9 +129,15 @@ export async function POST(request: Request) {
     });
   } catch (error) {
     if (error instanceof UpstreamError) {
+      console.error("POST /api/chat/stream upstream error", {
+        details: error.details,
+        message: error.message,
+        status: error.status
+      });
       return jsonError(error.status, error.message, error.details);
     }
 
+    console.error("POST /api/chat/stream unexpected error", error);
     return jsonError(500, "Unexpected server error.");
   }
 }
