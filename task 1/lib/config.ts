@@ -1,6 +1,6 @@
 import { parseAllowedModels } from "@/lib/models";
 
-type ServerConfig = {
+export type ServerConfig = {
   openRouterApiKey: string;
   serviceApiKey: string;
   defaultModel: string;

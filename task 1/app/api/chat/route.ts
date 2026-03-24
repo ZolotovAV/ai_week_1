@@ -1,8 +1,9 @@
 import { isAuthorized } from "@/lib/auth";
+import { chatAgent } from "@/lib/chat-agent";
 import { getServerConfig } from "@/lib/config";
 import { jsonError } from "@/lib/http";
-import { ModelSelectionError, resolveRequestedModel } from "@/lib/models";
-import { requestChatCompletion, UpstreamError } from "@/lib/openrouter";
+import { ModelSelectionError } from "@/lib/models";
+import { UpstreamError } from "@/lib/openrouter";
 import { chatRequestSchema } from "@/lib/types";
 
 export const runtime = "nodejs";
@@ -34,23 +35,13 @@ export async function POST(request: Request) {
   }
 
   try {
-    parsed.data.model = resolveRequestedModel(
-      parsed.data.model,
-      config.allowedModels,
-      config.defaultModel
-    );
+    const completion = await chatAgent.respond(config, parsed.data);
+    return Response.json(completion);
   } catch (error) {
     if (error instanceof ModelSelectionError) {
       return jsonError(400, error.message);
     }
 
-    return jsonError(400, "Invalid model selection.");
-  }
-
-  try {
-    const completion = await requestChatCompletion(parsed.data);
-    return Response.json(completion);
-  } catch (error) {
     if (error instanceof UpstreamError) {
       console.error("POST /api/chat upstream error", {
         details: error.details,

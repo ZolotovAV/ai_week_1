@@ -67,6 +67,7 @@ export function ChatConsole() {
   const [temperature, setTemperature] = useState("0.7");
   const [maxTokens, setMaxTokens] = useState("512");
   const [conversationHistory, setConversationHistory] = useState<ConversationMessage[]>([]);
+  const [sessionPromptTokens, setSessionPromptTokens] = useState(0);
   const [loading, setLoading] = useState(false);
   const [response, setResponse] = useState<ResponseState>({
     reply: "",
@@ -192,6 +193,7 @@ export function ChatConsole() {
 
   function handleClearContext() {
     setConversationHistory([]);
+    setSessionPromptTokens(0);
     setResponse({
       reply: "",
       status: "Idle",
@@ -228,6 +230,10 @@ export function ChatConsole() {
     setConversationHistory((current) =>
       appendConversationTurn(current, submittedPrompt, payload?.reply ?? "")
     );
+    const promptTokens = extractPromptTokens(payload?.usage);
+    if (promptTokens !== null) {
+      setSessionPromptTokens((current) => current + promptTokens);
+    }
     setResponse({
       reply: payload?.reply ?? "",
       status: "Completed",
@@ -260,9 +266,16 @@ export function ChatConsole() {
     while (true) {
       const { done, value } = await reader.read();
       if (done) {
-        flushClientSseBuffer(buffer, setResponse, (content) => {
-          assistantReply += content;
-        });
+        flushClientSseBuffer(
+          buffer,
+          setResponse,
+          (content) => {
+            assistantReply += content;
+          },
+          (promptTokens) => {
+            setSessionPromptTokens((current) => current + promptTokens);
+          }
+        );
         break;
       }
 
@@ -271,9 +284,16 @@ export function ChatConsole() {
       buffer = parts.pop() ?? "";
 
       for (const eventChunk of parts) {
-        applyParsedSseEvent(eventChunk, setResponse, (content) => {
-          assistantReply += content;
-        });
+        applyParsedSseEvent(
+          eventChunk,
+          setResponse,
+          (content) => {
+            assistantReply += content;
+          },
+          (promptTokens) => {
+            setSessionPromptTokens((current) => current + promptTokens);
+          }
+        );
       }
     }
 
@@ -488,6 +508,7 @@ export function ChatConsole() {
               <small className="field-hint">
                 Context messages: {conversationHistory.length}
               </small>
+              <small className="field-hint">Prompt tokens in context: {sessionPromptTokens}</small>
             </div>
           </div>
         </form>
@@ -575,7 +596,7 @@ function parseSseEvent(chunk: string) {
   try {
     return {
       event,
-      data: JSON.parse(dataLines.join("\n")) as Record<string, string>
+      data: JSON.parse(dataLines.join("\n")) as Record<string, unknown>
     };
   } catch {
     return null;
@@ -589,7 +610,8 @@ function splitClientSseEvents(buffer: string) {
 function applyParsedSseEvent(
   eventChunk: string,
   setResponse: Dispatch<SetStateAction<ResponseState>>,
-  onDelta?: (content: string) => void
+  onDelta?: (content: string) => void,
+  onUsage?: (promptTokens: number) => void
 ) {
   const parsed = parseSseEvent(eventChunk);
   if (!parsed) {
@@ -604,7 +626,7 @@ function applyParsedSseEvent(
   }
 
   if (parsed.event === "delta") {
-    const content = parsed.data.content ?? "";
+    const content = typeof parsed.data.content === "string" ? parsed.data.content : "";
     onDelta?.(content);
     setResponse((current) => ({
       ...current,
@@ -612,8 +634,17 @@ function applyParsedSseEvent(
     }));
   }
 
+  if (parsed.event === "usage") {
+    const promptTokens = extractPromptTokens(parsed.data);
+    if (promptTokens !== null) {
+      onUsage?.(promptTokens);
+    }
+  }
+
   if (parsed.event === "error") {
-    throw new Error(parsed.data.error ?? "Streaming upstream error.");
+    throw new Error(
+      typeof parsed.data.error === "string" ? parsed.data.error : "Streaming upstream error."
+    );
   }
 
   if (parsed.event === "done") {
@@ -627,7 +658,8 @@ function applyParsedSseEvent(
 function flushClientSseBuffer(
   buffer: string,
   setResponse: Dispatch<SetStateAction<ResponseState>>,
-  onDelta?: (content: string) => void
+  onDelta?: (content: string) => void,
+  onUsage?: (promptTokens: number) => void
 ) {
   const trimmedBuffer = buffer.trim();
   if (!trimmedBuffer) {
@@ -635,8 +667,23 @@ function flushClientSseBuffer(
   }
 
   for (const eventChunk of splitClientSseEvents(trimmedBuffer)) {
-    applyParsedSseEvent(eventChunk, setResponse, onDelta);
+    applyParsedSseEvent(eventChunk, setResponse, onDelta, onUsage);
   }
+}
+
+function extractPromptTokens(value: unknown) {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const promptTokens = (value as { prompt_tokens?: unknown; promptTokens?: unknown }).prompt_tokens
+    ?? (value as { prompt_tokens?: unknown; promptTokens?: unknown }).promptTokens;
+
+  if (typeof promptTokens !== "number" || !Number.isFinite(promptTokens) || promptTokens < 0) {
+    return null;
+  }
+
+  return promptTokens;
 }
 
 function appendConversationTurn(

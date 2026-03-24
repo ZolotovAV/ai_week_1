@@ -1,21 +1,4 @@
-import { getServerConfig } from "@/lib/config";
-import { resolveRequestedModel } from "@/lib/models";
-import type { ChatMessage, ChatRequest } from "@/lib/types";
-
-type OpenRouterMessage = {
-  content?: unknown;
-  reasoning?: unknown;
-};
-
-type OpenRouterSuccess = {
-  id?: string;
-  model?: string;
-  provider?: string;
-  usage?: Record<string, unknown>;
-  choices?: Array<{
-    message?: OpenRouterMessage;
-  }>;
-};
+import type { ServerConfig } from "@/lib/config";
 
 type OpenRouterErrorPayload = {
   error?: {
@@ -42,45 +25,7 @@ export class UpstreamError extends Error {
   }
 }
 
-export async function requestChatCompletion(input: ChatRequest) {
-  try {
-    const response = await fetchOpenRouter(input, false);
-    const payload = (await response.json()) as OpenRouterSuccess;
-    const message = payload.choices?.[0]?.message;
-
-    return {
-      id: payload.id ?? null,
-      model: payload.model ?? null,
-      provider: payload.provider ?? "openrouter",
-      usage: payload.usage ?? null,
-      reply: normalizeContent(message?.content),
-      reasoning: input.reasoning?.enabled ? extractReasoning(message) : undefined
-    };
-  } catch (error) {
-    throw mapUnexpectedUpstreamError(error);
-  }
-}
-
-export async function openRouterStream(input: ChatRequest) {
-  try {
-    const response = await fetchOpenRouter(input, true);
-    if (!response.body) {
-      throw new UpstreamError(502, "Upstream returned an empty streaming body.");
-    }
-
-    return response;
-  } catch (error) {
-    throw mapUnexpectedUpstreamError(error);
-  }
-}
-
-async function fetchOpenRouter(input: ChatRequest, stream: boolean) {
-  const config = getServerConfig();
-  const resolvedModel = resolveRequestedModel(
-    input.model,
-    config.allowedModels,
-    config.defaultModel
-  );
+export async function requestOpenRouter(config: ServerConfig, body: Record<string, unknown>) {
   let response: Response;
 
   try {
@@ -92,21 +37,7 @@ async function fetchOpenRouter(input: ChatRequest, stream: boolean) {
         ...(config.httpReferer ? { "HTTP-Referer": config.httpReferer } : {}),
         ...(config.appTitle ? { "X-Title": config.appTitle } : {})
       },
-      body: JSON.stringify({
-        model: resolvedModel,
-        messages: buildMessages(input),
-        stream,
-        ...(input.stopSequences?.length ? { stop: input.stopSequences } : {}),
-        ...(typeof input.temperature === "number" ? { temperature: input.temperature } : {}),
-        ...(typeof input.maxTokens === "number" ? { max_tokens: input.maxTokens } : {}),
-        ...(input.reasoning?.enabled
-          ? {
-              reasoning: {
-                effort: input.reasoning.effort ?? "medium"
-              }
-            }
-          : {})
-      }),
+      body: JSON.stringify(body),
       signal: AbortSignal.timeout(60_000)
     });
   } catch (error) {
@@ -121,91 +52,6 @@ async function fetchOpenRouter(input: ChatRequest, stream: boolean) {
   }
 
   return response;
-}
-
-function buildMessages(input: ChatRequest): ChatMessage[] {
-  const systemInstruction = buildSystemInstruction(input);
-
-  if (!systemInstruction) {
-    return input.messages;
-  }
-
-  return [
-    {
-      role: "system",
-      content: systemInstruction
-    },
-    ...input.messages
-  ];
-}
-
-function buildSystemInstruction(input: ChatRequest) {
-  const instructions = [
-    input.systemPrompt?.trim(),
-    input.responseFormat?.trim()
-      ? `Return the answer in this exact format: ${input.responseFormat.trim()}`
-      : undefined,
-    input.responseLength?.trim()
-      ? `Keep the entire answer within this limit: ${input.responseLength.trim()}`
-      : undefined,
-    input.completionInstruction?.trim()
-      ? `Finish the answer when this condition is met: ${input.completionInstruction.trim()}`
-      : undefined,
-    input.stopSequences?.length
-      ? `Stop generating immediately if you are about to output any of these sequences: ${input.stopSequences
-          .map((sequence) => JSON.stringify(sequence))
-          .join(", ")}`
-      : undefined
-  ].filter((instruction): instruction is string => Boolean(instruction));
-
-  if (instructions.length === 0) {
-    return undefined;
-  }
-
-  return instructions.join("\n\n");
-}
-
-function normalizeContent(content: unknown): string {
-  if (typeof content === "string") {
-    return content;
-  }
-
-  if (Array.isArray(content)) {
-    return content
-      .flatMap((part) => {
-        if (typeof part === "string") {
-          return [part];
-        }
-
-        if (
-          part &&
-          typeof part === "object" &&
-          "type" in part &&
-          "text" in part &&
-          (part as { type?: unknown }).type === "text" &&
-          typeof (part as { text?: unknown }).text === "string"
-        ) {
-          return [(part as { text: string }).text];
-        }
-
-        return [];
-      })
-      .join("");
-  }
-
-  return "";
-}
-
-function extractReasoning(message: OpenRouterMessage | undefined) {
-  if (!message || typeof message !== "object") {
-    return undefined;
-  }
-
-  if ("reasoning" in message) {
-    return (message as { reasoning?: unknown }).reasoning;
-  }
-
-  return undefined;
 }
 
 function mapUnexpectedUpstreamError(error: unknown) {

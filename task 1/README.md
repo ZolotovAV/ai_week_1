@@ -7,17 +7,25 @@
 - `GET /api/models` для списка доступных моделей OpenRouter
 - `POST /api/chat` для обычного JSON-ответа
 - `POST /api/chat/stream` для потокового ответа через SSE
+- выделенный модуль `lib/chat-agent.ts`, который инкапсулирует request/response lifecycle
 - demo UI на `/` для ручной проверки запросов из браузера
 - защита API через `Authorization: Bearer <SERVICE_API_KEY>`
 
 ## Как это работает
 
 1. Клиент отправляет запрос в ваш сервис.
-2. Сервис проверяет `SERVICE_API_KEY`.
-3. Сервер использует `OPENROUTER_API_KEY` и вызывает OpenRouter.
-4. Сервис возвращает нормализованный ответ клиенту.
+2. API route выполняет только HTTP-обвязку: проверяет `SERVICE_API_KEY`, парсит JSON и валидирует payload.
+3. `chatAgent` выбирает разрешённую модель, собирает system-инструкции и подготавливает upstream-запрос.
+4. Сервер использует `OPENROUTER_API_KEY`, вызывает OpenRouter и получает обычный или потоковый ответ.
+5. `chatAgent` нормализует ответ и возвращает его клиенту в JSON или `text/event-stream`.
 
 `OPENROUTER_API_KEY` хранится только на сервере и не уходит в браузер.
+
+## Архитектура агента
+
+- `app/api/chat` и `app/api/chat/stream` остаются тонкими маршрутами и отвечают только за HTTP concerns.
+- `lib/chat-agent.ts` содержит общую агентную оркестрацию для обычного и потокового режима.
+- `lib/openrouter.ts` используется как низкоуровневый транспорт к OpenRouter и маппинг upstream-ошибок.
 
 ## Требования
 
@@ -169,7 +177,7 @@ Content-Type: application/json
 
 ### POST /api/chat
 
-Возвращает обычный JSON-ответ.
+Возвращает обычный JSON-ответ. Внутри route передаёт уже валидированный запрос в `chatAgent.respond(...)`.
 
 Пример запроса:
 
@@ -217,13 +225,14 @@ Content-Type: application/json
 
 ### POST /api/chat/stream
 
-Возвращает поток `text/event-stream`.
+Возвращает поток `text/event-stream`. Внутри route использует тот же агентный слой через `chatAgent.stream(...)`.
 
 Тело запроса такое же, как у `/api/chat`.
 
 События потока:
 
 - `meta` — метаданные потока, приходит в начале
+- `usage` — информация о prompt tokens, если upstream прислал usage
 - `delta` — очередная часть текста
 - `done` — завершение потока
 - `error` — ошибка
@@ -233,6 +242,9 @@ Content-Type: application/json
 ```text
 event: meta
 data: {"model":"nvidia/nemotron-3-super-120b-a12b:free","provider":"openrouter"}
+
+event: usage
+data: {"promptTokens":12}
 
 event: delta
 data: {"content":"Hello"}
@@ -406,7 +418,7 @@ curl -N -X POST http://localhost:3000/api/chat/stream ^
 
 - `app/` — страницы и API routes Next.js
 - `components/` — клиентские UI-компоненты
-- `lib/` — конфиг, валидация, auth и OpenRouter-логика
+- `lib/` — конфиг, валидация, auth, агентная оркестрация и OpenRouter-транспорт
 - `scripts/` — вспомогательные скрипты
 
 ## Полезно знать
