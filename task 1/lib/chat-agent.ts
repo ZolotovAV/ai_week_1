@@ -1,8 +1,9 @@
 import type { ServerConfig } from "@/lib/config";
+import { conversationStore, ConversationNotFoundError } from "@/lib/conversation-store";
 import { sseEvent } from "@/lib/http";
 import { resolveRequestedModel } from "@/lib/models";
 import { requestOpenRouter, UpstreamError } from "@/lib/openrouter";
-import type { ChatMessage, ChatRequest } from "@/lib/types";
+import type { ChatMessage, ChatRequest, ConversationMessage } from "@/lib/types";
 
 type OpenRouterMessage = {
   content?: unknown;
@@ -20,11 +21,32 @@ type OpenRouterSuccess = {
 };
 
 type PreparedAgentRequest = {
+  conversationId: string;
   requestBody: Record<string, unknown>;
   selectedModel: string;
 };
 
-function prepareRequest(config: ServerConfig, input: ChatRequest, stream: boolean): PreparedAgentRequest {
+async function resolveConversationId(requestedConversationId?: string) {
+  if (!requestedConversationId) {
+    const createdConversation = await conversationStore.createConversation();
+    return createdConversation.conversationId;
+  }
+
+  const exists = await conversationStore.conversationExists(requestedConversationId);
+  if (!exists) {
+    throw new ConversationNotFoundError(requestedConversationId);
+  }
+
+  return requestedConversationId;
+}
+
+function prepareRequest(
+  config: ServerConfig,
+  input: ChatRequest,
+  conversationId: string,
+  history: ConversationMessage[],
+  stream: boolean
+): PreparedAgentRequest {
   const selectedModel = resolveRequestedModel(
     input.model,
     config.allowedModels,
@@ -32,10 +54,11 @@ function prepareRequest(config: ServerConfig, input: ChatRequest, stream: boolea
   );
 
   return {
+    conversationId,
     selectedModel,
     requestBody: {
       model: selectedModel,
-      messages: buildMessages(input),
+      messages: buildMessages(input, history),
       stream,
       ...(input.stopSequences?.length ? { stop: input.stopSequences } : {}),
       ...(typeof input.temperature === "number" ? { temperature: input.temperature } : {}),
@@ -51,11 +74,12 @@ function prepareRequest(config: ServerConfig, input: ChatRequest, stream: boolea
   };
 }
 
-function buildMessages(input: ChatRequest): ChatMessage[] {
+function buildMessages(input: ChatRequest, history: ConversationMessage[]): ChatMessage[] {
   const systemInstruction = buildSystemInstruction(input);
+  const conversationMessages: ChatMessage[] = [...history, { role: "user", content: input.prompt }];
 
   if (!systemInstruction) {
-    return input.messages;
+    return conversationMessages;
   }
 
   return [
@@ -63,7 +87,7 @@ function buildMessages(input: ChatRequest): ChatMessage[] {
       role: "system",
       content: systemInstruction
     },
-    ...input.messages
+    ...conversationMessages
   ];
 }
 
@@ -241,47 +265,80 @@ function parseUpstreamEvent(rawEvent: string) {
   };
 }
 
-function flushBufferedEvents(
-  buffer: string,
-  controller: ReadableStreamDefaultController<Uint8Array>,
-  encoder: TextEncoder
-) {
+function flushBufferedEvents(buffer: string) {
   const trimmedBuffer = buffer.trim();
   if (!trimmedBuffer) {
-    return;
+    return {
+      assistantReply: "",
+      deltas: [] as string[],
+      promptTokens: [] as number[]
+    };
   }
+
+  let assistantReply = "";
+  const deltas: string[] = [];
+  const promptTokens: number[] = [];
 
   for (const rawEvent of splitSseEvents(trimmedBuffer)) {
     const parsed = parseUpstreamEvent(rawEvent);
     if (parsed?.content) {
-      controller.enqueue(encoder.encode(sseEvent("delta", { content: parsed.content })));
+      assistantReply += parsed.content;
+      deltas.push(parsed.content);
     }
 
     if (parsed?.promptTokens !== null && parsed?.promptTokens !== undefined) {
-      controller.enqueue(encoder.encode(sseEvent("usage", { promptTokens: parsed.promptTokens })));
+      promptTokens.push(parsed.promptTokens);
     }
   }
+
+  return {
+    assistantReply,
+    deltas,
+    promptTokens
+  };
 }
 
 export const chatAgent = {
   async respond(config: ServerConfig, input: ChatRequest) {
-    const { requestBody } = prepareRequest(config, input, false);
+    const conversationId = await resolveConversationId(input.conversationId);
+    const history = await conversationStore.getConversationMessages(conversationId);
+
+    await conversationStore.appendMessage(conversationId, "user", input.prompt);
+
+    const { requestBody } = prepareRequest(config, input, conversationId, history, false);
     const response = await requestOpenRouter(config, requestBody);
     const payload = (await response.json()) as OpenRouterSuccess;
     const message = payload.choices?.[0]?.message;
+    const reply = normalizeContent(message?.content);
+
+    if (reply.trim()) {
+      await conversationStore.appendMessage(conversationId, "assistant", reply);
+    }
 
     return {
+      conversationId,
       id: payload.id ?? null,
       model: payload.model ?? null,
       provider: payload.provider ?? "openrouter",
       usage: payload.usage ?? null,
-      reply: normalizeContent(message?.content),
+      reply,
       reasoning: input.reasoning?.enabled ? extractReasoning(message) : undefined
     };
   },
 
   async stream(config: ServerConfig, input: ChatRequest) {
-    const { requestBody, selectedModel } = prepareRequest(config, input, true);
+    const conversationId = await resolveConversationId(input.conversationId);
+    const history = await conversationStore.getConversationMessages(conversationId);
+
+    await conversationStore.appendMessage(conversationId, "user", input.prompt);
+
+    const { requestBody, selectedModel } = prepareRequest(
+      config,
+      input,
+      conversationId,
+      history,
+      true
+    );
     const upstreamResponse = await requestOpenRouter(config, requestBody);
 
     if (!upstreamResponse.body) {
@@ -291,12 +348,24 @@ export const chatAgent = {
     const encoder = new TextEncoder();
     const decoder = new TextDecoder();
     let buffer = "";
+    let assistantReply = "";
+    let assistantReplySaved = false;
+
+    const persistAssistantReply = async () => {
+      if (assistantReplySaved || !assistantReply.trim()) {
+        return;
+      }
+
+      assistantReplySaved = true;
+      await conversationStore.appendMessage(conversationId, "assistant", assistantReply);
+    };
 
     const stream = new ReadableStream<Uint8Array>({
       async start(controller) {
         controller.enqueue(
           encoder.encode(
             sseEvent("meta", {
+              conversationId,
               model: selectedModel,
               provider: "openrouter"
             })
@@ -316,7 +385,17 @@ export const chatAgent = {
           while (true) {
             const { done, value } = await reader.read();
             if (done) {
-              flushBufferedEvents(buffer, controller, encoder);
+              const flushed = flushBufferedEvents(buffer);
+              assistantReply += flushed.assistantReply;
+
+              for (const delta of flushed.deltas) {
+                controller.enqueue(encoder.encode(sseEvent("delta", { content: delta })));
+              }
+
+              for (const promptTokens of flushed.promptTokens) {
+                controller.enqueue(encoder.encode(sseEvent("usage", { promptTokens })));
+              }
+
               break;
             }
 
@@ -337,17 +416,20 @@ export const chatAgent = {
               }
 
               if (parsed.done) {
+                await persistAssistantReply();
                 controller.enqueue(encoder.encode(sseEvent("done", { done: true })));
                 controller.close();
                 return;
               }
 
               if (parsed.content) {
+                assistantReply += parsed.content;
                 controller.enqueue(encoder.encode(sseEvent("delta", { content: parsed.content })));
               }
             }
           }
 
+          await persistAssistantReply();
           controller.enqueue(encoder.encode(sseEvent("done", { done: true })));
           controller.close();
         } catch (error) {

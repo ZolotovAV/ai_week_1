@@ -7,6 +7,8 @@
 - `GET /api/models` для списка доступных моделей OpenRouter
 - `POST /api/chat` для обычного JSON-ответа
 - `POST /api/chat/stream` для потокового ответа через SSE
+- `GET /api/conversations/:conversationId` для загрузки сохранённой истории
+- `DELETE /api/conversations/:conversationId` для удаления сохранённого диалога
 - выделенный модуль `lib/chat-agent.ts`, который инкапсулирует request/response lifecycle
 - demo UI на `/` для ручной проверки запросов из браузера
 - защита API через `Authorization: Bearer <SERVICE_API_KEY>`
@@ -189,13 +191,9 @@ Content-Type: application/json
 
 ```json
 {
+  "conversationId": "optional-uuid-for-existing-dialog",
+  "prompt": "Say hello in one sentence.",
   "model": "openai/gpt-4o-mini",
-  "messages": [
-    {
-      "role": "user",
-      "content": "Say hello in one sentence."
-    }
-  ],
   "systemPrompt": "You are concise.",
   "temperature": 0.7,
   "maxTokens": 256,
@@ -210,6 +208,7 @@ Content-Type: application/json
 
 ```json
 {
+  "conversationId": "b5ea0f1e-4d4d-4c2f-8f93-99c7be3ef001",
   "id": "gen-123",
   "model": "nvidia/nemotron-3-super-120b-a12b:free",
   "provider": "openrouter",
@@ -241,7 +240,7 @@ Content-Type: application/json
 
 ```text
 event: meta
-data: {"model":"nvidia/nemotron-3-super-120b-a12b:free","provider":"openrouter"}
+data: {"conversationId":"b5ea0f1e-4d4d-4c2f-8f93-99c7be3ef001","model":"nvidia/nemotron-3-super-120b-a12b:free","provider":"openrouter"}
 
 event: usage
 data: {"promptTokens":12}
@@ -391,7 +390,7 @@ data: {"done":true}
 curl -X POST http://localhost:3000/api/chat ^
   -H "Authorization: Bearer YOUR_SERVICE_API_KEY" ^
   -H "Content-Type: application/json" ^
-  -d "{\"messages\":[{\"role\":\"user\",\"content\":\"Tell me a joke.\"}]}"
+  -d "{\"prompt\":\"Tell me a joke.\"}"
 ```
 
 ### curl для SSE
@@ -400,7 +399,7 @@ curl -X POST http://localhost:3000/api/chat ^
 curl -N -X POST http://localhost:3000/api/chat/stream ^
   -H "Authorization: Bearer YOUR_SERVICE_API_KEY" ^
   -H "Content-Type: application/json" ^
-  -d "{\"messages\":[{\"role\":\"user\",\"content\":\"Count to five.\"}]}"
+  -d "{\"prompt\":\"Count to five.\"}"
 ```
 
 ## Ошибки

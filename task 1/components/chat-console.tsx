@@ -1,7 +1,7 @@
 "use client";
 
 import type { Dispatch, FormEvent, SetStateAction } from "react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 type Mode = "json" | "stream";
 
@@ -30,9 +30,10 @@ type ConversationMessage = {
 
 type ChatRequestPayload = {
   completionInstruction?: string;
+  conversationId?: string;
   maxTokens?: number;
-  messages: ConversationMessage[];
   model?: string;
+  prompt: string;
   reasoning?:
     | {
         enabled: true;
@@ -47,6 +48,7 @@ type ChatRequestPayload = {
 };
 
 const SERVICE_KEY_STORAGE = "nemotron-service-api-key";
+const CONVERSATION_ID_STORAGE = "nemotron-conversation-id";
 
 export function ChatConsole() {
   const [serviceKey, setServiceKey] = useState("");
@@ -66,9 +68,12 @@ export function ChatConsole() {
   const [reasoningEffort, setReasoningEffort] = useState("medium");
   const [temperature, setTemperature] = useState("0.7");
   const [maxTokens, setMaxTokens] = useState("512");
+  const [activeConversationId, setActiveConversationId] = useState("");
   const [conversationHistory, setConversationHistory] = useState<ConversationMessage[]>([]);
+  const [restoringConversation, setRestoringConversation] = useState(false);
   const [sessionPromptTokens, setSessionPromptTokens] = useState(0);
   const [loading, setLoading] = useState(false);
+  const lastRestoreAttemptRef = useRef("");
   const [response, setResponse] = useState<ResponseState>({
     reply: "",
     status: "Idle",
@@ -78,8 +83,14 @@ export function ChatConsole() {
 
   useEffect(() => {
     const savedKey = window.sessionStorage.getItem(SERVICE_KEY_STORAGE);
+    const savedConversationId = window.localStorage.getItem(CONVERSATION_ID_STORAGE);
+
     if (savedKey) {
       setServiceKey(savedKey);
+    }
+
+    if (savedConversationId) {
+      setActiveConversationId(savedConversationId);
     }
   }, []);
 
@@ -123,6 +134,118 @@ export function ChatConsole() {
     };
   }, []);
 
+  useEffect(() => {
+    const normalizedServiceKey = serviceKey.trim();
+    if (!normalizedServiceKey || !activeConversationId) {
+      return;
+    }
+
+    const restoreAttemptKey = `${normalizedServiceKey}:${activeConversationId}`;
+    if (lastRestoreAttemptRef.current === restoreAttemptKey) {
+      return;
+    }
+
+    let cancelled = false;
+    lastRestoreAttemptRef.current = restoreAttemptKey;
+
+    async function restoreConversation() {
+      setRestoringConversation(true);
+      setResponse((current) => ({
+        ...current,
+        status: current.reply ? current.status : "Restoring context...",
+        error: ""
+      }));
+
+      try {
+        const apiResponse = await fetch(`/api/conversations/${activeConversationId}`, {
+          headers: buildHeaders(normalizedServiceKey)
+        });
+
+        const payload = (await apiResponse.json().catch(() => null)) as
+          | {
+              conversationId?: string;
+              messages?: ConversationMessage[];
+              error?: string;
+              details?: unknown;
+            }
+          | null;
+
+        if (apiResponse.status === 404) {
+          if (!cancelled) {
+            clearPersistedConversationId();
+            setActiveConversationId("");
+            setConversationHistory([]);
+            setResponse({
+              reply: "",
+              status: "Idle",
+              meta: "",
+              error: ""
+            });
+          }
+          return;
+        }
+
+        if (!apiResponse.ok) {
+          throw new Error(formatApiError(apiResponse.status, payload));
+        }
+
+        if (!cancelled) {
+          setConversationHistory(payload?.messages ?? []);
+          setResponse((current) => ({
+            ...current,
+            status: "Idle",
+            error: ""
+          }));
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setResponse((current) => ({
+            ...current,
+            status: "Idle",
+            error: `Failed to restore saved conversation. ${toClientErrorMessage(error)}`
+          }));
+        }
+      } finally {
+        if (!cancelled) {
+          setRestoringConversation(false);
+        }
+      }
+    }
+
+    void restoreConversation();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeConversationId, serviceKey]);
+
+  function persistConversationId(conversationId: string) {
+    setActiveConversationId(conversationId);
+    const normalizedServiceKey = serviceKey.trim();
+    if (normalizedServiceKey) {
+      lastRestoreAttemptRef.current = `${normalizedServiceKey}:${conversationId}`;
+    }
+    window.localStorage.setItem(CONVERSATION_ID_STORAGE, conversationId);
+  }
+
+  function clearPersistedConversationId() {
+    window.localStorage.removeItem(CONVERSATION_ID_STORAGE);
+  }
+
+  function resetConversationState() {
+    clearPersistedConversationId();
+    setActiveConversationId("");
+    setConversationHistory([]);
+    lastRestoreAttemptRef.current = "";
+    setSessionPromptTokens(0);
+    setResponse({
+      reply: "",
+      status: "Idle",
+      meta: "",
+      error: ""
+    });
+  }
+
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const normalizedServiceKey = serviceKey.trim();
@@ -149,8 +272,8 @@ export function ChatConsole() {
     }
 
     const requestBody = buildRequestBody({
+      activeConversationId,
       completionInstruction,
-      conversationHistory,
       maxTokens,
       prompt: normalizedPrompt,
       reasoningEffort,
@@ -191,15 +314,46 @@ export function ChatConsole() {
     }
   }
 
-  function handleClearContext() {
-    setConversationHistory([]);
-    setSessionPromptTokens(0);
-    setResponse({
-      reply: "",
-      status: "Idle",
-      meta: "",
-      error: ""
-    });
+  async function handleClearContext() {
+    if (loading || restoringConversation) {
+      return;
+    }
+
+    const normalizedServiceKey = serviceKey.trim();
+
+    if (!activeConversationId) {
+      resetConversationState();
+      return;
+    }
+
+    if (!normalizedServiceKey) {
+      setResponse((current) => ({
+        ...current,
+        status: "Failed",
+        error: "Enter SERVICE_API_KEY before clearing a saved conversation."
+      }));
+      return;
+    }
+
+    try {
+      const apiResponse = await fetch(`/api/conversations/${activeConversationId}`, {
+        method: "DELETE",
+        headers: buildHeaders(normalizedServiceKey)
+      });
+
+      if (!apiResponse.ok) {
+        const payload = (await apiResponse.json().catch(() => null)) as ApiErrorPayload | null;
+        throw new Error(formatApiError(apiResponse.status, payload));
+      }
+
+      resetConversationState();
+    } catch (error) {
+      setResponse((current) => ({
+        ...current,
+        status: "Failed",
+        error: toClientErrorMessage(error)
+      }));
+    }
   }
 
   async function submitJson(
@@ -215,6 +369,7 @@ export function ChatConsole() {
 
     const payload = (await apiResponse.json().catch(() => null)) as
       | {
+          conversationId?: string;
           reply?: string;
           model?: string;
           usage?: Record<string, unknown>;
@@ -225,6 +380,10 @@ export function ChatConsole() {
 
     if (!apiResponse.ok) {
       throw new Error(formatApiError(apiResponse.status, payload));
+    }
+
+    if (typeof payload?.conversationId === "string") {
+      persistConversationId(payload.conversationId);
     }
 
     setConversationHistory((current) =>
@@ -274,6 +433,9 @@ export function ChatConsole() {
           },
           (promptTokens) => {
             setSessionPromptTokens((current) => current + promptTokens);
+          },
+          (conversationId) => {
+            persistConversationId(conversationId);
           }
         );
         break;
@@ -292,6 +454,9 @@ export function ChatConsole() {
           },
           (promptTokens) => {
             setSessionPromptTokens((current) => current + promptTokens);
+          },
+          (conversationId) => {
+            persistConversationId(conversationId);
           }
         );
       }
@@ -494,14 +659,14 @@ export function ChatConsole() {
             </label>
 
             <div className="action-card">
-              <button type="submit" disabled={loading}>
+              <button type="submit" disabled={loading || restoringConversation}>
                 {loading ? "Working..." : "Send request"}
               </button>
               <button
                 className="secondary-action"
                 type="button"
                 onClick={handleClearContext}
-                disabled={loading || conversationHistory.length === 0}
+                disabled={loading || restoringConversation || conversationHistory.length === 0}
               >
                 Clear context
               </button>
@@ -509,16 +674,21 @@ export function ChatConsole() {
                 Context messages: {conversationHistory.length}
               </small>
               <small className="field-hint">Prompt tokens in context: {sessionPromptTokens}</small>
+              {activeConversationId ? (
+                <small className="field-hint">
+                  Conversation ID: <code>{activeConversationId}</code>
+                </small>
+              ) : null}
             </div>
           </div>
         </form>
 
         <section className="panel output-panel">
           <div className="status-line">
-            <strong>{response.status}</strong>
+            <strong>{restoringConversation ? "Restoring context..." : response.status}</strong>
             {response.meta ? <span>{response.meta}</span> : null}
           </div>
-          <div className="output-content">{buildOutputText(response)}</div>
+          <div className="output-content">{buildOutputText(response, restoringConversation)}</div>
           {response.error ? <p className="error">{response.error}</p> : null}
         </section>
       </section>
@@ -611,7 +781,8 @@ function applyParsedSseEvent(
   eventChunk: string,
   setResponse: Dispatch<SetStateAction<ResponseState>>,
   onDelta?: (content: string) => void,
-  onUsage?: (promptTokens: number) => void
+  onUsage?: (promptTokens: number) => void,
+  onConversationId?: (conversationId: string) => void
 ) {
   const parsed = parseSseEvent(eventChunk);
   if (!parsed) {
@@ -619,6 +790,10 @@ function applyParsedSseEvent(
   }
 
   if (parsed.event === "meta") {
+    if (typeof parsed.data.conversationId === "string") {
+      onConversationId?.(parsed.data.conversationId);
+    }
+
     setResponse((current) => ({
       ...current,
       meta: parsed.data.model ? `Model: ${parsed.data.model}` : current.meta
@@ -659,7 +834,8 @@ function flushClientSseBuffer(
   buffer: string,
   setResponse: Dispatch<SetStateAction<ResponseState>>,
   onDelta?: (content: string) => void,
-  onUsage?: (promptTokens: number) => void
+  onUsage?: (promptTokens: number) => void,
+  onConversationId?: (conversationId: string) => void
 ) {
   const trimmedBuffer = buffer.trim();
   if (!trimmedBuffer) {
@@ -667,7 +843,7 @@ function flushClientSseBuffer(
   }
 
   for (const eventChunk of splitClientSseEvents(trimmedBuffer)) {
-    applyParsedSseEvent(eventChunk, setResponse, onDelta, onUsage);
+    applyParsedSseEvent(eventChunk, setResponse, onDelta, onUsage, onConversationId);
   }
 }
 
@@ -701,8 +877,8 @@ function appendConversationTurn(
 }
 
 function buildRequestBody(input: {
+  activeConversationId: string;
   completionInstruction: string;
-  conversationHistory: ConversationMessage[];
   maxTokens: string;
   prompt: string;
   reasoningEffort: string;
@@ -718,7 +894,8 @@ function buildRequestBody(input: {
   const numericMaxTokens = Number(input.maxTokens);
 
   return {
-    messages: [...input.conversationHistory, { role: "user", content: input.prompt }],
+    prompt: input.prompt,
+    conversationId: input.activeConversationId || undefined,
     model: input.selectedModel || undefined,
     systemPrompt: input.systemPrompt.trim() || undefined,
     responseFormat: input.responseFormat.trim() || undefined,
@@ -736,9 +913,13 @@ function buildRequestBody(input: {
   };
 }
 
-function buildOutputText(response: ResponseState) {
+function buildOutputText(response: ResponseState, restoringConversation: boolean) {
   if (response.reply) {
     return response.reply;
+  }
+
+  if (restoringConversation) {
+    return "Loading the saved conversation from the server.";
   }
 
   if (response.status === "Completed" && !response.error) {

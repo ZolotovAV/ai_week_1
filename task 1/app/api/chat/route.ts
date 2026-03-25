@@ -1,5 +1,6 @@
 import { isAuthorized } from "@/lib/auth";
 import { chatAgent } from "@/lib/chat-agent";
+import { ConversationNotFoundError } from "@/lib/conversation-store";
 import { getServerConfig } from "@/lib/config";
 import { jsonError } from "@/lib/http";
 import { ModelSelectionError } from "@/lib/models";
@@ -38,6 +39,10 @@ export async function POST(request: Request) {
     const completion = await chatAgent.respond(config, parsed.data);
     return Response.json(completion);
   } catch (error) {
+    if (error instanceof ConversationNotFoundError) {
+      return jsonError(404, error.message);
+    }
+
     if (error instanceof ModelSelectionError) {
       return jsonError(400, error.message);
     }

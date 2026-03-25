@@ -5,8 +5,16 @@ export const chatMessageSchema = z.object({
   content: z.string().min(1).max(20000)
 });
 
+export const conversationMessageSchema = z.object({
+  role: z.enum(["user", "assistant"]),
+  content: z.string().min(1).max(20000)
+});
+
+export const conversationIdSchema = z.string().uuid();
+
 export const chatRequestSchema = z.object({
-  messages: z.array(chatMessageSchema).min(1),
+  prompt: z.string().min(1).max(20000),
+  conversationId: conversationIdSchema.optional(),
   model: z.string().min(1).max(200).optional(),
   systemPrompt: z.string().min(1).max(4000).optional(),
   responseFormat: z.string().min(1).max(2000).optional(),
@@ -24,4 +32,5 @@ export const chatRequestSchema = z.object({
 });
 
 export type ChatMessage = z.infer<typeof chatMessageSchema>;
+export type ConversationMessage = z.infer<typeof conversationMessageSchema>;
 export type ChatRequest = z.infer<typeof chatRequestSchema>;
