@@ -3,9 +3,10 @@ import { chatAgent } from "@/lib/chat-agent";
 import { ConversationNotFoundError } from "@/lib/conversation-store";
 import { getServerConfig } from "@/lib/config";
 import { jsonError } from "@/lib/http";
+import { resolveMaxConfiguredTokens } from "@/lib/model-context";
 import { ModelSelectionError } from "@/lib/models";
 import { UpstreamError } from "@/lib/openrouter";
-import { chatRequestSchema } from "@/lib/types";
+import { createChatRequestSchema } from "@/lib/types";
 
 export const runtime = "nodejs";
 
@@ -30,7 +31,9 @@ export async function POST(request: Request) {
     return jsonError(400, "Request body must be valid JSON.");
   }
 
-  const parsed = chatRequestSchema.safeParse(payload);
+  const parsed = createChatRequestSchema(
+    resolveMaxConfiguredTokens(config.allowedModels, config.modelContextWindows)
+  ).safeParse(payload);
   if (!parsed.success) {
     return jsonError(400, "Invalid request payload.", parsed.error.flatten());
   }

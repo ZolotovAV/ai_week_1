@@ -9,7 +9,11 @@ export async function GET() {
 
     return Response.json({
       defaultModel: config.defaultModel,
-      models: buildModelCatalog(config.defaultModel, config.allowedModels)
+      models: buildModelCatalog(
+        config.defaultModel,
+        config.allowedModels,
+        config.modelContextWindows
+      )
     });
   } catch (error) {
     return Response.json(

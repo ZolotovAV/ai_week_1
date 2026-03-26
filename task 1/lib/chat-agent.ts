@@ -3,7 +3,8 @@ import { conversationStore, ConversationNotFoundError } from "@/lib/conversation
 import { sseEvent } from "@/lib/http";
 import { resolveRequestedModel } from "@/lib/models";
 import { requestOpenRouter, UpstreamError } from "@/lib/openrouter";
-import type { ChatMessage, ChatRequest, ConversationMessage } from "@/lib/types";
+import { estimateTokenUsage, finalizeTokenUsage, mergeUsage, normalizeUsage } from "@/lib/token-usage";
+import type { ChatMessage, ChatRequest, ConversationMessage, NormalizedUsage } from "@/lib/types";
 
 type OpenRouterMessage = {
   content?: unknown;
@@ -22,6 +23,7 @@ type OpenRouterSuccess = {
 
 type PreparedAgentRequest = {
   conversationId: string;
+  messages: ChatMessage[];
   requestBody: Record<string, unknown>;
   selectedModel: string;
 };
@@ -52,13 +54,15 @@ function prepareRequest(
     config.allowedModels,
     config.defaultModel
   );
+  const messages = buildMessages(input, history);
 
   return {
     conversationId,
+    messages,
     selectedModel,
     requestBody: {
       model: selectedModel,
-      messages: buildMessages(input, history),
+      messages,
       stream,
       ...(input.stopSequences?.length ? { stop: input.stopSequences } : {}),
       ...(typeof input.temperature === "number" ? { temperature: input.temperature } : {}),
@@ -222,20 +226,6 @@ function extractDelta(event: Record<string, unknown>) {
   return "";
 }
 
-function extractPromptTokens(event: Record<string, unknown>) {
-  const usage = event.usage;
-  if (!usage || typeof usage !== "object") {
-    return null;
-  }
-
-  const promptTokens = (usage as { prompt_tokens?: unknown }).prompt_tokens;
-  if (typeof promptTokens !== "number" || !Number.isFinite(promptTokens) || promptTokens < 0) {
-    return null;
-  }
-
-  return promptTokens;
-}
-
 function parseUpstreamEvent(rawEvent: string) {
   const dataLines = rawEvent
     .split(/\r?\n/)
@@ -248,7 +238,7 @@ function parseUpstreamEvent(rawEvent: string) {
 
   const data = dataLines.join("\n");
   if (data === "[DONE]") {
-    return { done: true, content: "", promptTokens: null };
+    return { done: true, content: "", usage: null as NormalizedUsage | null };
   }
 
   let parsedEvent: Record<string, unknown>;
@@ -261,7 +251,7 @@ function parseUpstreamEvent(rawEvent: string) {
   return {
     done: false,
     content: extractDelta(parsedEvent),
-    promptTokens: extractPromptTokens(parsedEvent)
+    usage: normalizeUsage(parsedEvent.usage)
   };
 }
 
@@ -271,13 +261,13 @@ function flushBufferedEvents(buffer: string) {
     return {
       assistantReply: "",
       deltas: [] as string[],
-      promptTokens: [] as number[]
+      usage: null as NormalizedUsage | null
     };
   }
 
   let assistantReply = "";
   const deltas: string[] = [];
-  const promptTokens: number[] = [];
+  let usage: NormalizedUsage | null = null;
 
   for (const rawEvent of splitSseEvents(trimmedBuffer)) {
     const parsed = parseUpstreamEvent(rawEvent);
@@ -286,15 +276,15 @@ function flushBufferedEvents(buffer: string) {
       deltas.push(parsed.content);
     }
 
-    if (parsed?.promptTokens !== null && parsed?.promptTokens !== undefined) {
-      promptTokens.push(parsed.promptTokens);
+    if (parsed?.usage) {
+      usage = mergeUsage(usage, parsed.usage);
     }
   }
 
   return {
     assistantReply,
     deltas,
-    promptTokens
+    usage
   };
 }
 
@@ -305,11 +295,24 @@ export const chatAgent = {
 
     await conversationStore.appendMessage(conversationId, "user", input.prompt);
 
-    const { requestBody } = prepareRequest(config, input, conversationId, history, false);
+    const { messages, requestBody, selectedModel } = prepareRequest(
+      config,
+      input,
+      conversationId,
+      history,
+      false
+    );
+    const estimatedTokenUsage = estimateTokenUsage({
+      messages,
+      model: selectedModel,
+      modelContextWindows: config.modelContextWindows,
+      requestedMaxTokens: input.maxTokens
+    });
     const response = await requestOpenRouter(config, requestBody);
     const payload = (await response.json()) as OpenRouterSuccess;
     const message = payload.choices?.[0]?.message;
     const reply = normalizeContent(message?.content);
+    const tokenUsage = finalizeTokenUsage(estimatedTokenUsage, normalizeUsage(payload.usage), reply);
 
     if (reply.trim()) {
       await conversationStore.appendMessage(conversationId, "assistant", reply);
@@ -321,6 +324,7 @@ export const chatAgent = {
       model: payload.model ?? null,
       provider: payload.provider ?? "openrouter",
       usage: payload.usage ?? null,
+      tokenUsage,
       reply,
       reasoning: input.reasoning?.enabled ? extractReasoning(message) : undefined
     };
@@ -332,13 +336,19 @@ export const chatAgent = {
 
     await conversationStore.appendMessage(conversationId, "user", input.prompt);
 
-    const { requestBody, selectedModel } = prepareRequest(
+    const { messages, requestBody, selectedModel } = prepareRequest(
       config,
       input,
       conversationId,
       history,
       true
     );
+    const estimatedTokenUsage = estimateTokenUsage({
+      messages,
+      model: selectedModel,
+      modelContextWindows: config.modelContextWindows,
+      requestedMaxTokens: input.maxTokens
+    });
     const upstreamResponse = await requestOpenRouter(config, requestBody);
 
     if (!upstreamResponse.body) {
@@ -350,6 +360,7 @@ export const chatAgent = {
     let buffer = "";
     let assistantReply = "";
     let assistantReplySaved = false;
+    let latestUsage: NormalizedUsage | null = null;
 
     const persistAssistantReply = async () => {
       if (assistantReplySaved || !assistantReply.trim()) {
@@ -367,7 +378,8 @@ export const chatAgent = {
             sseEvent("meta", {
               conversationId,
               model: selectedModel,
-              provider: "openrouter"
+              provider: "openrouter",
+              tokenUsage: estimatedTokenUsage
             })
           )
         );
@@ -387,13 +399,25 @@ export const chatAgent = {
             if (done) {
               const flushed = flushBufferedEvents(buffer);
               assistantReply += flushed.assistantReply;
+              latestUsage = mergeUsage(latestUsage, flushed.usage);
 
               for (const delta of flushed.deltas) {
                 controller.enqueue(encoder.encode(sseEvent("delta", { content: delta })));
               }
 
-              for (const promptTokens of flushed.promptTokens) {
-                controller.enqueue(encoder.encode(sseEvent("usage", { promptTokens })));
+              if (latestUsage) {
+                controller.enqueue(
+                  encoder.encode(
+                    sseEvent("usage", {
+                      usage: latestUsage,
+                      tokenUsage: finalizeTokenUsage(
+                        estimatedTokenUsage,
+                        latestUsage,
+                        assistantReply
+                      )
+                    })
+                  )
+                );
               }
 
               break;
@@ -409,9 +433,19 @@ export const chatAgent = {
                 continue;
               }
 
-              if (parsed.promptTokens !== null) {
+              if (parsed.usage) {
+                latestUsage = mergeUsage(latestUsage, parsed.usage);
                 controller.enqueue(
-                  encoder.encode(sseEvent("usage", { promptTokens: parsed.promptTokens }))
+                  encoder.encode(
+                    sseEvent("usage", {
+                      usage: latestUsage,
+                      tokenUsage: finalizeTokenUsage(
+                        estimatedTokenUsage,
+                        latestUsage,
+                        assistantReply + parsed.content
+                      )
+                    })
+                  )
                 );
               }
 
@@ -430,6 +464,14 @@ export const chatAgent = {
           }
 
           await persistAssistantReply();
+          controller.enqueue(
+            encoder.encode(
+              sseEvent("usage", {
+                usage: latestUsage,
+                tokenUsage: finalizeTokenUsage(estimatedTokenUsage, latestUsage, assistantReply)
+              })
+            )
+          );
           controller.enqueue(encoder.encode(sseEvent("done", { done: true })));
           controller.close();
         } catch (error) {

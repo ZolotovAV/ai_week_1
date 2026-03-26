@@ -1,7 +1,10 @@
+import { resolveModelContextWindow } from "@/lib/model-context";
+
 export type ModelOption = {
   id: string;
   label: string;
   isDefault: boolean;
+  maxTokensLimit: number;
 };
 
 export class ModelSelectionError extends Error {
@@ -27,11 +30,16 @@ export function parseAllowedModels(defaultModel: string, rawAllowedModels?: stri
   return allowedModels;
 }
 
-export function buildModelCatalog(defaultModel: string, allowedModels: string[]): ModelOption[] {
+export function buildModelCatalog(
+  defaultModel: string,
+  allowedModels: string[],
+  modelContextWindows: Record<string, number>
+): ModelOption[] {
   return allowedModels.map((modelId) => ({
     id: modelId,
     label: modelId,
-    isDefault: modelId === defaultModel
+    isDefault: modelId === defaultModel,
+    maxTokensLimit: resolveModelContextWindow(modelId, modelContextWindows)
   }));
 }
 

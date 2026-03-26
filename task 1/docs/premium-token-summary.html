@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Premium Token Summary</title>
+  <style>
+    :root {
+      --bg: #f4ede2;
+      --paper: #fbf7f0;
+      --paper-strong: #fffdf9;
+      --line: #d9c6aa;
+      --line-soft: #e7d9c5;
+      --text: #2e241b;
+      --muted: #756453;
+      --accent: #a56b26;
+      --accent-soft: #f2e4d0;
+      --shadow: rgba(63, 43, 20, 0.08);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      padding: 28px;
+      color: var(--text);
+      font-family: Georgia, "Times New Roman", serif;
+      background:
+        radial-gradient(circle at top right, rgba(255, 251, 245, 0.95) 0%, rgba(255, 251, 245, 0) 28%),
+        linear-gradient(180deg, #f8f1e6 0%, var(--bg) 100%);
+    }
+
+    .sheet {
+      max-width: 1120px;
+      margin: 0 auto;
+      background: linear-gradient(180deg, var(--paper-strong) 0%, var(--paper) 100%);
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      padding: 24px 24px 18px;
+      box-shadow:
+        0 14px 40px var(--shadow),
+        inset 0 1px 0 rgba(255, 255, 255, 0.8);
+    }
+
+    .masthead {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 16px;
+      padding-bottom: 18px;
+      margin-bottom: 18px;
+      border-bottom: 1px solid var(--line-soft);
+    }
+
+    .eyebrow {
+      margin: 0 0 6px;
+      color: var(--muted);
+      font-size: 0.88rem;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+    }
+
+    .headline {
+      margin: 0 0 8px;
+      font-size: clamp(1.8rem, 3vw, 2.6rem);
+      font-weight: 700;
+      line-height: 1.05;
+    }
+
+    .subhead {
+      margin: 0;
+      color: var(--muted);
+      font-size: 1.02rem;
+      line-height: 1.4;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 14px;
+      border-radius: 999px;
+      border: 1px solid #d4b58e;
+      background: var(--accent-soft);
+      color: var(--accent);
+      white-space: nowrap;
+      font-size: 0.92rem;
+      line-height: 1;
+    }
+
+    .badge::before {
+      content: "";
+      width: 7px;
+      height: 7px;
+      border-radius: 999px;
+      background: currentColor;
+      opacity: 0.8;
+    }
+
+    .stats-table {
+      width: 100%;
+      border-collapse: collapse;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: rgba(255, 255, 255, 0.34);
+      margin-top: 4px;
+    }
+
+    .stats-table thead th {
+      text-align: left;
+      font-size: 0.8rem;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: var(--muted);
+      font-weight: 600;
+      padding: 14px 18px;
+      background: rgba(242, 228, 208, 0.38);
+      border-bottom: 1px solid var(--line);
+    }
+
+    .stats-table tbody td {
+      padding: 16px 18px;
+      border-bottom: 1px solid var(--line-soft);
+      vertical-align: top;
+    }
+
+    .stats-table tbody tr:last-child td {
+      border-bottom: none;
+    }
+
+    .metric {
+      font-size: 1rem;
+      color: var(--text);
+      width: 28%;
+    }
+
+    .number {
+      font-size: 1.55rem;
+      font-weight: 700;
+      line-height: 1;
+      width: 18%;
+      white-space: nowrap;
+    }
+
+    .detail {
+      color: var(--muted);
+      line-height: 1.45;
+      font-size: 0.96rem;
+    }
+
+    .foot {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      margin-top: 16px;
+      padding-top: 16px;
+      border-top: 1px solid var(--line-soft);
+      color: var(--muted);
+      font-size: 0.95rem;
+    }
+
+    .copy {
+      color: var(--accent);
+      text-decoration: none;
+      font-weight: 600;
+    }
+
+    .copy:hover {
+      text-decoration: underline;
+    }
+
+    @media (max-width: 860px) {
+      .stats-table,
+      .stats-table thead,
+      .stats-table tbody,
+      .stats-table tr,
+      .stats-table th,
+      .stats-table td {
+        display: block;
+        width: 100%;
+      }
+
+      .stats-table thead {
+        display: none;
+      }
+
+      .stats-table tbody tr {
+        border-bottom: 1px solid var(--line-soft);
+        padding: 14px 0;
+      }
+
+      .stats-table tbody tr:last-child {
+        border-bottom: none;
+      }
+
+      .stats-table tbody td {
+        border-bottom: none;
+        padding: 4px 18px;
+      }
+
+      .metric {
+        font-size: 1.08rem;
+      }
+
+      .number {
+        padding-top: 8px;
+        padding-bottom: 6px;
+      }
+    }
+
+    @media (max-width: 560px) {
+      body {
+        padding: 14px;
+      }
+
+      .sheet {
+        padding: 18px 16px 14px;
+        border-radius: 18px;
+      }
+
+      .masthead,
+      .foot {
+        flex-direction: column;
+        align-items: flex-start;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="sheet">
+    <header class="masthead">
+      <div>
+        <p class="eyebrow">Context Summary</p>
+        <h1 class="headline">Completed request profile</h1>
+        <p class="subhead">A tighter, more editorial presentation of token usage and context pressure.</p>
+      </div>
+      <div class="badge">Warning</div>
+    </header>
+
+    <table class="stats-table">
+      <thead>
+        <tr>
+          <th scope="col">Metric</th>
+          <th scope="col">Value</th>
+          <th scope="col">Detail</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="metric">Current request</td>
+          <td class="number">17</td>
+          <td class="detail">Estimated user prompt tokens for the upcoming turn.</td>
+        </tr>
+        <tr>
+          <td class="metric">History</td>
+          <td class="number">10,279</td>
+          <td class="detail">Estimated tokens already carried from prior user and assistant turns.</td>
+        </tr>
+        <tr>
+          <td class="metric">Next total</td>
+          <td class="number">10,311</td>
+          <td class="detail">Current estimate for the next prompt after combining history with the present request.</td>
+        </tr>
+        <tr>
+          <td class="metric">Model response</td>
+          <td class="number">3,921</td>
+          <td class="detail">Token count of the most recent response, updated after completion.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <footer class="foot">
+      <div>Conversation ID: 0e670e71-8259-4357-ba0d-94bf4058b42a</div>
+      <a href="#" class="copy">Copy ID</a>
+    </footer>
+  </main>
+</body>
+</html>

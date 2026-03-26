@@ -12,7 +12,14 @@ export const conversationMessageSchema = z.object({
 
 export const conversationIdSchema = z.string().uuid();
 
-export const chatRequestSchema = z.object({
+const reasoningSchema = z
+  .object({
+    enabled: z.boolean(),
+    effort: z.enum(["low", "medium", "high"]).optional()
+  })
+  .optional();
+
+const chatRequestBaseSchema = z.object({
   prompt: z.string().min(1).max(20000),
   conversationId: conversationIdSchema.optional(),
   model: z.string().min(1).max(200).optional(),
@@ -22,15 +29,65 @@ export const chatRequestSchema = z.object({
   stopSequences: z.array(z.string().min(1).max(200)).min(1).max(4).optional(),
   completionInstruction: z.string().min(1).max(1000).optional(),
   temperature: z.number().min(0).max(2).optional(),
-  maxTokens: z.number().int().min(1).max(4096).optional(),
-  reasoning: z
-    .object({
-      enabled: z.boolean(),
-      effort: z.enum(["low", "medium", "high"]).optional()
-    })
-    .optional()
+  maxTokens: z.number().int().min(1).optional(),
+  reasoning: reasoningSchema
 });
+
+export function createChatRequestSchema(maxTokensLimit: number) {
+  return chatRequestBaseSchema.extend({
+    maxTokens: z.number().int().min(1).max(maxTokensLimit).optional()
+  });
+}
 
 export type ChatMessage = z.infer<typeof chatMessageSchema>;
 export type ConversationMessage = z.infer<typeof conversationMessageSchema>;
-export type ChatRequest = z.infer<typeof chatRequestSchema>;
+export type ChatRequest = z.infer<typeof chatRequestBaseSchema>;
+
+export type TokenGuardrailStatus = "ok" | "warning" | "near_limit";
+
+export type TokenGuardrailReason =
+  | "history_dominates_request"
+  | "prompt_near_context_limit"
+  | "total_near_context_limit"
+  | "requested_completion_exceeds_available_budget";
+
+export type NormalizedUsage = {
+  promptTokens: number | null;
+  completionTokens: number | null;
+  totalTokens: number | null;
+};
+
+export type TokenUsage = {
+  request: {
+    current: {
+      estimated: number;
+    };
+    history: {
+      estimated: number;
+    };
+    system: {
+      estimated: number;
+    };
+    prompt: {
+      estimated: number;
+      actual: number | null;
+    };
+  };
+  response: {
+    requestedMax: number | null;
+    availableBudget: number;
+    estimated: number | null;
+    actual: number | null;
+  };
+  totals: {
+    estimated: number;
+    actual: number | null;
+  };
+  guardrail: {
+    status: TokenGuardrailStatus;
+    reasons: TokenGuardrailReason[];
+    historyShare: number;
+    contextWindow: number;
+    estimatedContextUsageRatio: number;
+  };
+};

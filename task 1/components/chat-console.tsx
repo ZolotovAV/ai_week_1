@@ -3,6 +3,9 @@
 import type { Dispatch, FormEvent, SetStateAction } from "react";
 import { useEffect, useRef, useState } from "react";
 
+import { DEFAULT_CONTEXT_WINDOW } from "@/lib/model-context";
+import type { TokenGuardrailReason, TokenUsage } from "@/lib/types";
+
 type Mode = "json" | "stream";
 
 type ResponseState = {
@@ -16,6 +19,7 @@ type ModelOption = {
   id: string;
   label: string;
   isDefault: boolean;
+  maxTokensLimit: number;
 };
 
 type ApiErrorPayload = {
@@ -26,6 +30,16 @@ type ApiErrorPayload = {
 type ConversationMessage = {
   content: string;
   role: "assistant" | "user";
+};
+
+type ChatResponsePayload = {
+  conversationId?: string;
+  error?: string;
+  details?: unknown;
+  model?: string;
+  reply?: string;
+  tokenUsage?: TokenUsage;
+  usage?: Record<string, unknown>;
 };
 
 type ChatRequestPayload = {
@@ -71,7 +85,7 @@ export function ChatConsole() {
   const [activeConversationId, setActiveConversationId] = useState("");
   const [conversationHistory, setConversationHistory] = useState<ConversationMessage[]>([]);
   const [restoringConversation, setRestoringConversation] = useState(false);
-  const [sessionPromptTokens, setSessionPromptTokens] = useState(0);
+  const [tokenUsage, setTokenUsage] = useState<TokenUsage | null>(null);
   const [loading, setLoading] = useState(false);
   const lastRestoreAttemptRef = useRef("");
   const [response, setResponse] = useState<ResponseState>({
@@ -80,6 +94,62 @@ export function ChatConsole() {
     meta: "",
     error: ""
   });
+  const selectedModelOption =
+    availableModels.find((model) => model.id === selectedModel) ??
+    availableModels.find((model) => model.isDefault) ??
+    null;
+  const selectedModelMaxTokens = selectedModelOption?.maxTokensLimit ?? DEFAULT_CONTEXT_WINDOW;
+  const liveTokenBudget = estimateLiveTokenBudget({
+    completionInstruction,
+    conversationHistory,
+    maxTokens,
+    prompt,
+    responseFormat,
+    responseLength,
+    selectedModelMaxTokens,
+    stopSequence,
+    systemPrompt
+  });
+  const requestedMaxTokens = liveTokenBudget.requestedMaxTokens;
+  const isMaxTokensLimitExceeded =
+    requestedMaxTokens !== null && requestedMaxTokens > liveTokenBudget.availableBudget;
+  const exceededTokens = isMaxTokensLimitExceeded
+    ? requestedMaxTokens - liveTokenBudget.availableBudget
+    : 0;
+  const submitButtonLabel = loading
+    ? "Working..."
+    : isMaxTokensLimitExceeded
+      ? `Limit exceeded by ${formatTokenCount(exceededTokens)}`
+      : "Send request";
+  const latestResponseTokens = tokenUsage?.response.actual ?? tokenUsage?.response.estimated ?? null;
+  const latestPromptActualTokens = tokenUsage?.request.prompt.actual ?? null;
+  const guardrailInlineSummary = tokenUsage
+    ? buildGuardrailInlineSummary(tokenUsage)
+    : isMaxTokensLimitExceeded
+      ? `Requested completion exceeds the remaining budget by ${formatTokenCount(exceededTokens)} tokens.`
+      : `Available response budget: ${formatTokenCount(liveTokenBudget.availableBudget)} tokens.`;
+  const tokenSummaryRows = [
+    {
+      detail: "Estimated prompt tokens from the current input.",
+      metric: "Current request",
+      value: formatTokenCount(liveTokenBudget.currentRequestTokens)
+    },
+    {
+      detail: "Estimated tokens already carried from earlier user and assistant turns.",
+      metric: "History",
+      value: formatTokenCount(liveTokenBudget.historyTokens)
+    },
+    {
+      detail: `Current estimate for the next prompt. Last actual: ${formatNullableTokenCount(latestPromptActualTokens)}.`,
+      metric: "Next total",
+      value: formatTokenCount(liveTokenBudget.promptTokensEstimated)
+    },
+    {
+      detail: "Last response tokens. Updates after the model completes this request.",
+      metric: "Model response",
+      value: formatNullableTokenCount(latestResponseTokens)
+    }
+  ];
 
   useEffect(() => {
     const savedKey = window.sessionStorage.getItem(SERVICE_KEY_STORAGE);
@@ -175,6 +245,7 @@ export function ChatConsole() {
             clearPersistedConversationId();
             setActiveConversationId("");
             setConversationHistory([]);
+            setTokenUsage(null);
             setResponse({
               reply: "",
               status: "Idle",
@@ -219,6 +290,15 @@ export function ChatConsole() {
     };
   }, [activeConversationId, serviceKey]);
 
+  useEffect(() => {
+    const numericMaxTokens = Number(maxTokens);
+    if (!Number.isFinite(numericMaxTokens) || numericMaxTokens <= selectedModelMaxTokens) {
+      return;
+    }
+
+    setMaxTokens(String(selectedModelMaxTokens));
+  }, [maxTokens, selectedModelMaxTokens]);
+
   function persistConversationId(conversationId: string) {
     setActiveConversationId(conversationId);
     const normalizedServiceKey = serviceKey.trim();
@@ -237,10 +317,10 @@ export function ChatConsole() {
     setActiveConversationId("");
     setConversationHistory([]);
     lastRestoreAttemptRef.current = "";
-    setSessionPromptTokens(0);
+    setTokenUsage(null);
     setResponse({
       reply: "",
-      status: "Idle",
+      status: "Context cleared",
       meta: "",
       error: ""
     });
@@ -367,16 +447,7 @@ export function ChatConsole() {
       body: JSON.stringify(requestBody)
     });
 
-    const payload = (await apiResponse.json().catch(() => null)) as
-      | {
-          conversationId?: string;
-          reply?: string;
-          model?: string;
-          usage?: Record<string, unknown>;
-          error?: string;
-          details?: unknown;
-        }
-      | null;
+    const payload = (await apiResponse.json().catch(() => null)) as ChatResponsePayload | null;
 
     if (!apiResponse.ok) {
       throw new Error(formatApiError(apiResponse.status, payload));
@@ -389,10 +460,7 @@ export function ChatConsole() {
     setConversationHistory((current) =>
       appendConversationTurn(current, submittedPrompt, payload?.reply ?? "")
     );
-    const promptTokens = extractPromptTokens(payload?.usage);
-    if (promptTokens !== null) {
-      setSessionPromptTokens((current) => current + promptTokens);
-    }
+    setTokenUsage(resolveTokenUsage(payload?.tokenUsage, payload?.usage, payload?.reply ?? ""));
     setResponse({
       reply: payload?.reply ?? "",
       status: "Completed",
@@ -431,8 +499,8 @@ export function ChatConsole() {
           (content) => {
             assistantReply += content;
           },
-          (promptTokens) => {
-            setSessionPromptTokens((current) => current + promptTokens);
+          (nextTokenUsage) => {
+            setTokenUsage(nextTokenUsage);
           },
           (conversationId) => {
             persistConversationId(conversationId);
@@ -452,8 +520,8 @@ export function ChatConsole() {
           (content) => {
             assistantReply += content;
           },
-          (promptTokens) => {
-            setSessionPromptTokens((current) => current + promptTokens);
+          (nextTokenUsage) => {
+            setTokenUsage(nextTokenUsage);
           },
           (conversationId) => {
             persistConversationId(conversationId);
@@ -592,10 +660,21 @@ export function ChatConsole() {
               <input
                 type="number"
                 min="1"
-                max="4096"
+                max={String(selectedModelMaxTokens)}
                 value={maxTokens}
                 onChange={(event) => setMaxTokens(event.target.value)}
               />
+              <small className="field-hint">
+                Current model allows up to {formatTokenCount(selectedModelMaxTokens)} total
+                tokens. Available response budget right now:{" "}
+                {formatTokenCount(liveTokenBudget.availableBudget)}.
+              </small>
+              {isMaxTokensLimitExceeded ? (
+                <small className="field-hint">
+                  Requested max tokens exceed the current budget by{" "}
+                  {formatTokenCount(exceededTokens)}.
+                </small>
+              ) : null}
             </label>
 
             <label className="field-card">
@@ -660,25 +739,24 @@ export function ChatConsole() {
 
             <div className="action-card">
               <button type="submit" disabled={loading || restoringConversation}>
-                {loading ? "Working..." : "Send request"}
+                {submitButtonLabel}
               </button>
-              <button
-                className="secondary-action"
-                type="button"
-                onClick={handleClearContext}
-                disabled={loading || restoringConversation || conversationHistory.length === 0}
-              >
-                Clear context
-              </button>
-              <small className="field-hint">
-                Context messages: {conversationHistory.length}
-              </small>
-              <small className="field-hint">Prompt tokens in context: {sessionPromptTokens}</small>
-              {activeConversationId ? (
-                <small className="field-hint">
-                  Conversation ID: <code>{activeConversationId}</code>
+              <div className="action-support">
+                <small className="field-hint action-summary">
+                  Context: {conversationHistory.length} saved messages.
                 </small>
-              ) : null}
+                <button
+                  className="secondary-action subtle-action"
+                  type="button"
+                  onClick={handleClearContext}
+                  disabled={loading || restoringConversation || conversationHistory.length === 0}
+                >
+                  Clear context
+                </button>
+              </div>
+              <small className="field-hint action-note">
+                Clears saved history only. Request estimates are shown below.
+              </small>
             </div>
           </div>
         </form>
@@ -687,7 +765,38 @@ export function ChatConsole() {
           <div className="status-line">
             <strong>{restoringConversation ? "Restoring context..." : response.status}</strong>
             {response.meta ? <span>{response.meta}</span> : null}
+            {tokenUsage ? (
+              <span className={`guardrail-pill guardrail-${tokenUsage.guardrail.status}`}>
+                {formatGuardrailStatus(tokenUsage.guardrail.status)}
+              </span>
+            ) : null}
+            <span className="status-detail">{guardrailInlineSummary}</span>
           </div>
+          <section className="token-summary" aria-label="Token usage">
+            <table className="token-table" aria-label="Token usage summary">
+              <thead>
+                <tr>
+                  <th scope="col">Metric</th>
+                  <th scope="col">Value</th>
+                  <th scope="col">Detail</th>
+                </tr>
+              </thead>
+              <tbody>
+                {tokenSummaryRows.map((row) => (
+                  <tr key={row.metric}>
+                    <td className="token-metric">{row.metric}</td>
+                    <td className="token-value">{row.value}</td>
+                    <td className="token-detail">{row.detail}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </section>
+          {activeConversationId ? (
+            <p className="field-hint output-meta token-footer">
+              Conversation ID: <code>{activeConversationId}</code>
+            </p>
+          ) : null}
           <div className="output-content">{buildOutputText(response, restoringConversation)}</div>
           {response.error ? <p className="error">{response.error}</p> : null}
         </section>
@@ -781,7 +890,7 @@ function applyParsedSseEvent(
   eventChunk: string,
   setResponse: Dispatch<SetStateAction<ResponseState>>,
   onDelta?: (content: string) => void,
-  onUsage?: (promptTokens: number) => void,
+  onTokenUsage?: (tokenUsage: TokenUsage) => void,
   onConversationId?: (conversationId: string) => void
 ) {
   const parsed = parseSseEvent(eventChunk);
@@ -798,6 +907,11 @@ function applyParsedSseEvent(
       ...current,
       meta: parsed.data.model ? `Model: ${parsed.data.model}` : current.meta
     }));
+
+    const tokenUsage = extractTokenUsage(parsed.data.tokenUsage);
+    if (tokenUsage) {
+      onTokenUsage?.(tokenUsage);
+    }
   }
 
   if (parsed.event === "delta") {
@@ -810,9 +924,12 @@ function applyParsedSseEvent(
   }
 
   if (parsed.event === "usage") {
-    const promptTokens = extractPromptTokens(parsed.data);
-    if (promptTokens !== null) {
-      onUsage?.(promptTokens);
+    const tokenUsage =
+      extractTokenUsage(parsed.data.tokenUsage)
+      ?? resolveTokenUsage(undefined, parsed.data.usage, "");
+
+    if (tokenUsage) {
+      onTokenUsage?.(tokenUsage);
     }
   }
 
@@ -834,7 +951,7 @@ function flushClientSseBuffer(
   buffer: string,
   setResponse: Dispatch<SetStateAction<ResponseState>>,
   onDelta?: (content: string) => void,
-  onUsage?: (promptTokens: number) => void,
+  onTokenUsage?: (tokenUsage: TokenUsage) => void,
   onConversationId?: (conversationId: string) => void
 ) {
   const trimmedBuffer = buffer.trim();
@@ -843,23 +960,114 @@ function flushClientSseBuffer(
   }
 
   for (const eventChunk of splitClientSseEvents(trimmedBuffer)) {
-    applyParsedSseEvent(eventChunk, setResponse, onDelta, onUsage, onConversationId);
+    applyParsedSseEvent(eventChunk, setResponse, onDelta, onTokenUsage, onConversationId);
   }
 }
 
-function extractPromptTokens(value: unknown) {
+function readNumber(value: unknown) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    return null;
+  }
+
+  return value;
+}
+
+function extractTokenUsage(value: unknown) {
   if (!value || typeof value !== "object") {
     return null;
   }
 
-  const promptTokens = (value as { prompt_tokens?: unknown; promptTokens?: unknown }).prompt_tokens
-    ?? (value as { prompt_tokens?: unknown; promptTokens?: unknown }).promptTokens;
+  const record = value as {
+    guardrail?: unknown;
+    request?: unknown;
+    response?: unknown;
+    totals?: unknown;
+  };
 
-  if (typeof promptTokens !== "number" || !Number.isFinite(promptTokens) || promptTokens < 0) {
+  if (
+    !record.request ||
+    typeof record.request !== "object" ||
+    !record.response ||
+    typeof record.response !== "object" ||
+    !record.totals ||
+    typeof record.totals !== "object" ||
+    !record.guardrail ||
+    typeof record.guardrail !== "object"
+  ) {
     return null;
   }
 
-  return promptTokens;
+  return value as TokenUsage;
+}
+
+function resolveTokenUsage(
+  tokenUsage: TokenUsage | undefined,
+  usage: unknown,
+  reply: string
+): TokenUsage | null {
+  if (tokenUsage) {
+    return tokenUsage;
+  }
+
+  if (!usage || typeof usage !== "object") {
+    return null;
+  }
+
+  const promptTokens = readNumber(
+    (usage as { prompt_tokens?: unknown; promptTokens?: unknown }).prompt_tokens
+      ?? (usage as { prompt_tokens?: unknown; promptTokens?: unknown }).promptTokens
+  );
+  const completionTokens = readNumber(
+    (usage as { completion_tokens?: unknown; completionTokens?: unknown }).completion_tokens
+      ?? (usage as { completion_tokens?: unknown; completionTokens?: unknown }).completionTokens
+  );
+  const totalTokens = readNumber(
+    (usage as { total_tokens?: unknown; totalTokens?: unknown }).total_tokens
+      ?? (usage as { total_tokens?: unknown; totalTokens?: unknown }).totalTokens
+  );
+
+  if (promptTokens === null && completionTokens === null && totalTokens === null) {
+    return null;
+  }
+
+  const estimatedResponseTokens = reply.trim()
+    ? Math.max(1, Math.ceil(reply.length / 4))
+    : 0;
+
+  return {
+    request: {
+      current: {
+        estimated: 0
+      },
+      history: {
+        estimated: 0
+      },
+      system: {
+        estimated: 0
+      },
+      prompt: {
+        estimated: promptTokens ?? 0,
+        actual: promptTokens
+      }
+    },
+    response: {
+      requestedMax: null,
+      availableBudget: 0,
+      estimated: estimatedResponseTokens,
+      actual: completionTokens
+    },
+    totals: {
+      estimated: (promptTokens ?? 0) + estimatedResponseTokens,
+      actual: totalTokens
+    },
+    guardrail: {
+      status: "ok",
+      reasons: [] as TokenGuardrailReason[],
+      historyShare: 0,
+      contextWindow: 0,
+      estimatedContextUsageRatio: 0
+    }
+  };
 }
 
 function appendConversationTurn(
@@ -874,6 +1082,134 @@ function appendConversationTurn(
   }
 
   return nextHistory;
+}
+
+function estimateLiveTokenBudget(input: {
+  completionInstruction: string;
+  conversationHistory: ConversationMessage[];
+  maxTokens: string;
+  prompt: string;
+  responseFormat: string;
+  responseLength: string;
+  selectedModelMaxTokens: number;
+  stopSequence: string;
+  systemPrompt: string;
+}) {
+  const systemInstruction = buildSystemInstructionPreview({
+    completionInstruction: input.completionInstruction,
+    responseFormat: input.responseFormat,
+    responseLength: input.responseLength,
+    stopSequence: input.stopSequence,
+    systemPrompt: input.systemPrompt
+  });
+  const messages: Array<ConversationMessage | { role: "system"; content: string }> = [
+    ...(systemInstruction ? [{ role: "system" as const, content: systemInstruction }] : []),
+    ...input.conversationHistory,
+    { role: "user", content: input.prompt }
+  ];
+  const lastUserMessageIndex = messages.reduce(
+    (lastIndex, message, index) => (message.role === "user" ? index : lastIndex),
+    -1
+  );
+  let currentRequestTokens = 0;
+  let historyTokens = 0;
+  let systemTokens = 0;
+
+  for (const [index, message] of messages.entries()) {
+    const estimatedTokens = estimateMessageTokens(message.role, message.content);
+
+    if (message.role === "system") {
+      systemTokens += estimatedTokens;
+      continue;
+    }
+
+    if (message.role === "assistant") {
+      historyTokens += estimatedTokens;
+      continue;
+    }
+
+    if (index === lastUserMessageIndex) {
+      currentRequestTokens = estimatedTokens;
+      continue;
+    }
+
+    historyTokens += estimatedTokens;
+  }
+
+  const promptTokensEstimated = currentRequestTokens + historyTokens + systemTokens + 2;
+  const requestedMaxTokens = toFinitePositiveInteger(input.maxTokens);
+  const availableBudget = Math.max(0, input.selectedModelMaxTokens - promptTokensEstimated);
+
+  return {
+    availableBudget,
+    currentRequestTokens,
+    historyTokens,
+    promptTokensEstimated,
+    requestedMaxTokens
+  };
+}
+
+function buildSystemInstructionPreview(input: {
+  completionInstruction: string;
+  responseFormat: string;
+  responseLength: string;
+  stopSequence: string;
+  systemPrompt: string;
+}) {
+  const instructions = [
+    input.systemPrompt.trim() || undefined,
+    input.responseFormat.trim()
+      ? `Return the answer in this exact format: ${input.responseFormat.trim()}`
+      : undefined,
+    input.responseLength.trim()
+      ? `Keep the entire answer within this limit: ${input.responseLength.trim()}`
+      : undefined,
+    input.completionInstruction.trim()
+      ? `Finish the answer when this condition is met: ${input.completionInstruction.trim()}`
+      : undefined,
+    input.stopSequence.trim()
+      ? `Stop generating immediately if you are about to output any of these sequences: ${JSON.stringify(input.stopSequence.trim())}`
+      : undefined
+  ].filter((instruction): instruction is string => Boolean(instruction));
+
+  return instructions.length > 0 ? instructions.join("\n\n") : undefined;
+}
+
+function estimateMessageTokens(role: "assistant" | "system" | "user", content: string) {
+  return 4 + estimateTextTokens(role) + estimateTextTokens(content);
+}
+
+function estimateTextTokens(text: string) {
+  const normalized = text.trim();
+  if (!normalized) {
+    return 0;
+  }
+
+  const segments = normalized.match(/\p{L}+|\p{N}+|[^\s]/gu) ?? [];
+  if (segments.length === 0) {
+    return Math.max(1, Math.ceil(readUtf8ByteLength(normalized) / 4));
+  }
+
+  return segments.reduce((total, segment) => {
+    if (/^[\p{L}\p{N}]+$/u.test(segment)) {
+      return total + Math.max(1, Math.ceil(readUtf8ByteLength(segment) / 4));
+    }
+
+    return total + 1;
+  }, 0);
+}
+
+function readUtf8ByteLength(value: string) {
+  return new TextEncoder().encode(value).length;
+}
+
+function toFinitePositiveInteger(value: string) {
+  const numericValue = Number(value);
+  if (!Number.isFinite(numericValue) || numericValue <= 0) {
+    return null;
+  }
+
+  return Math.round(numericValue);
 }
 
 function buildRequestBody(input: {
@@ -927,4 +1263,50 @@ function buildOutputText(response: ResponseState, restoringConversation: boolean
   }
 
   return "The model response will appear here.";
+}
+
+function formatTokenCount(value: number) {
+  return Intl.NumberFormat("en-US").format(value);
+}
+
+function formatNullableTokenCount(value: number | null) {
+  return value === null ? "n/a" : formatTokenCount(value);
+}
+
+function formatGuardrailStatus(status: TokenUsage["guardrail"]["status"]) {
+  if (status === "near_limit") {
+    return "Near context limit";
+  }
+
+  if (status === "warning") {
+    return "Watch context";
+  }
+
+  return "Context healthy";
+}
+
+function formatGuardrailReason(reason: TokenGuardrailReason) {
+  switch (reason) {
+    case "history_dominates_request":
+      return "Earlier messages now outweigh the new request.";
+    case "prompt_near_context_limit":
+      return "This prompt is already getting large for the selected model.";
+    case "total_near_context_limit":
+      return "Prompt plus requested completion is close to the model context window.";
+    case "requested_completion_exceeds_available_budget":
+      return "Requested completion is larger than the remaining context budget.";
+    default:
+      return "Token pressure is affecting the agent.";
+  }
+}
+
+function buildGuardrailInlineSummary(tokenUsage: TokenUsage) {
+  const reasons = tokenUsage.guardrail.reasons;
+  const historyShare = Math.round(tokenUsage.guardrail.historyShare * 100);
+
+  if (reasons.length === 0) {
+    return `Current prompt fits comfortably within the model context budget. ${formatTokenCount(tokenUsage.response.availableBudget)} response tokens remain available.`;
+  }
+
+  return `${reasons.map(formatGuardrailReason).join(" ")} History share: ${historyShare}%.`;
 }

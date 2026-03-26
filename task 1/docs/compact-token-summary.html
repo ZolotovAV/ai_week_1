@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Compact Token Summary</title>
+  <style>
+    :root {
+      --bg: #f7f1e7;
+      --panel: #fbf6ee;
+      --line: #dccbb3;
+      --text: #2f241a;
+      --muted: #7c6755;
+      --accent: #b97a2b;
+      --warn-bg: #f6ead7;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: radial-gradient(circle at top left, #fffaf2 0%, var(--bg) 48%, #f1e7d7 100%);
+      color: var(--text);
+      font-family: Georgia, "Times New Roman", serif;
+      padding: 24px;
+    }
+
+    .wrap {
+      max-width: 1120px;
+      margin: 0 auto;
+      background: color-mix(in srgb, var(--panel) 92%, white 8%);
+      border: 1px solid var(--line);
+      border-radius: 20px;
+      padding: 20px;
+      box-shadow: 0 10px 36px rgba(70, 45, 20, 0.06);
+    }
+
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 18px;
+      padding-bottom: 14px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .title {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: baseline;
+    }
+
+    .title strong {
+      font-size: 1.9rem;
+      font-weight: 700;
+    }
+
+    .title span {
+      color: var(--muted);
+      font-size: 1.15rem;
+    }
+
+    .badge {
+      white-space: nowrap;
+      border: 1px solid #d7b98b;
+      background: var(--warn-bg);
+      color: var(--accent);
+      border-radius: 999px;
+      padding: 8px 14px;
+      font-size: 0.95rem;
+      line-height: 1;
+    }
+
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+
+    .stat {
+      padding: 14px 16px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: rgba(255, 255, 255, 0.3);
+    }
+
+    .label {
+      color: var(--muted);
+      font-size: 0.95rem;
+      margin-bottom: 8px;
+    }
+
+    .value {
+      font-size: 2rem;
+      font-weight: 700;
+      line-height: 1;
+      margin-bottom: 6px;
+    }
+
+    .hint {
+      color: var(--muted);
+      font-size: 0.92rem;
+      line-height: 1.35;
+    }
+
+    .status {
+      display: flex;
+      gap: 10px;
+      align-items: flex-start;
+      padding: 14px 16px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: linear-gradient(180deg, rgba(255, 255, 255, 0.34), rgba(255, 255, 255, 0.16));
+      margin-bottom: 14px;
+    }
+
+    .status-mark {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 22px;
+      height: 22px;
+      flex: 0 0 auto;
+      border-radius: 999px;
+      border: 1px solid #d7b98b;
+      color: var(--accent);
+      font-size: 0.9rem;
+      line-height: 1;
+      margin-top: 2px;
+    }
+
+    .status strong {
+      display: block;
+      font-size: 1.15rem;
+      margin-bottom: 2px;
+    }
+
+    .footer {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      padding-top: 12px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 0.95rem;
+    }
+
+    .copy {
+      color: var(--accent);
+      text-decoration: none;
+      font-weight: 600;
+    }
+
+    .copy:hover {
+      text-decoration: underline;
+    }
+
+    @media (max-width: 860px) {
+      .stats {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+    }
+
+    @media (max-width: 520px) {
+      body {
+        padding: 12px;
+      }
+
+      .wrap {
+        padding: 14px;
+        border-radius: 16px;
+      }
+
+      .topbar,
+      .footer {
+        flex-direction: column;
+        align-items: flex-start;
+      }
+
+      .stats {
+        grid-template-columns: 1fr;
+      }
+
+      .title strong {
+        font-size: 1.55rem;
+      }
+
+      .title span {
+        font-size: 1rem;
+      }
+    }
+  </style>
+</head>
+<body>
+  <section class="wrap">
+    <header class="topbar">
+      <div class="title">
+        <strong>Completed</strong>
+        <span>Model: nvidia/nemotron-3-nano-30b-a3b:free</span>
+      </div>
+      <div class="badge">Warning</div>
+    </header>
+
+    <section class="stats">
+      <article class="stat">
+        <div class="label">Current request</div>
+        <div class="value">17</div>
+        <div class="hint">Estimated prompt tokens</div>
+      </article>
+
+      <article class="stat">
+        <div class="label">History</div>
+        <div class="value">10,279</div>
+        <div class="hint">Prior turns already in context</div>
+      </article>
+
+      <article class="stat">
+        <div class="label">Next total</div>
+        <div class="value">10,311</div>
+        <div class="hint">Current estimate for next prompt</div>
+      </article>
+
+      <article class="stat">
+        <div class="label">Model response</div>
+        <div class="value">3,921</div>
+        <div class="hint">Last response tokens</div>
+      </article>
+    </section>
+
+    <section class="status">
+      <div class="status-mark">!</div>
+      <div>
+        <strong>Agent is biasing toward prior context (100% history share).</strong>
+        <div class="hint">History already dominates the current request.</div>
+      </div>
+    </section>
+
+    <footer class="footer">
+      <div>Conversation ID: 0e670e71-8259-4357-ba0d-94bf4058b42a</div>
+      <a href="#" class="copy">Copy ID</a>
+    </footer>
+  </section>
+</body>
+</html>
