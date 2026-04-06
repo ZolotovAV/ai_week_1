@@ -32,13 +32,41 @@ type ConversationMessage = {
   role: "assistant" | "user";
 };
 
+type ContextCompressionMeta = {
+  compressedMessages?: number;
+  coveredMessageCount?: number;
+  enabled?: boolean;
+  estimateIsApproximate?: boolean;
+  retainedMessages?: number;
+  summaryPresent?: boolean;
+};
+
+type ContextSnapshotPayload = {
+  contextCompression?: ContextCompressionMeta | null;
+  summary?: string | null;
+};
+
+type ConversationRestorePayload = {
+  contextCompression?: ContextCompressionMeta;
+  conversationId?: string;
+  details?: unknown;
+  error?: string;
+  messages?: ConversationMessage[];
+  savedContext?: ContextSnapshotPayload | null;
+  summary?: string | null;
+};
+
 type ChatResponsePayload = {
+  contextCompression?: ContextCompressionMeta;
   conversationId?: string;
   error?: string;
   details?: unknown;
   model?: string;
   reply?: string;
+  savedContext?: ContextSnapshotPayload | null;
+  summary?: string | null;
   tokenUsage?: TokenUsage;
+  usedContext?: ContextSnapshotPayload | null;
   usage?: Record<string, unknown>;
 };
 
@@ -84,6 +112,8 @@ export function ChatConsole() {
   const [maxTokens, setMaxTokens] = useState("512");
   const [activeConversationId, setActiveConversationId] = useState("");
   const [conversationHistory, setConversationHistory] = useState<ConversationMessage[]>([]);
+  const [conversationSummary, setConversationSummary] = useState<string | null>(null);
+  const [contextCompression, setContextCompression] = useState<ContextCompressionMeta | null>(null);
   const [restoringConversation, setRestoringConversation] = useState(false);
   const [tokenUsage, setTokenUsage] = useState<TokenUsage | null>(null);
   const [loading, setLoading] = useState(false);
@@ -99,17 +129,26 @@ export function ChatConsole() {
     availableModels.find((model) => model.isDefault) ??
     null;
   const selectedModelMaxTokens = selectedModelOption?.maxTokensLimit ?? DEFAULT_CONTEXT_WINDOW;
+  const effectiveConversationHistory = selectEffectiveConversationHistory(
+    conversationHistory,
+    contextCompression
+  );
   const liveTokenBudget = estimateLiveTokenBudget({
     completionInstruction,
-    conversationHistory,
+    conversationHistory: effectiveConversationHistory,
     maxTokens,
     prompt,
     responseFormat,
     responseLength,
     selectedModelMaxTokens,
+    summary: conversationSummary,
     stopSequence,
     systemPrompt
   });
+  const liveEstimateIsApproximate = isApproximateLiveEstimate(
+    contextCompression,
+    conversationSummary
+  );
   const requestedMaxTokens = liveTokenBudget.requestedMaxTokens;
   const isMaxTokensLimitExceeded =
     requestedMaxTokens !== null && requestedMaxTokens > liveTokenBudget.availableBudget;
@@ -127,20 +166,31 @@ export function ChatConsole() {
     ? buildGuardrailInlineSummary(tokenUsage)
     : isMaxTokensLimitExceeded
       ? `Requested completion exceeds the remaining budget by ${formatTokenCount(exceededTokens)} tokens.`
-      : `Available response budget: ${formatTokenCount(liveTokenBudget.availableBudget)} tokens.`;
+      : liveEstimateIsApproximate
+        ? `Approximate budget from the effective context currently available on the client. Server token usage becomes authoritative after the next response.`
+        : `Available response budget: ${formatTokenCount(liveTokenBudget.availableBudget)} tokens.`;
+  const contextCompressionSummary = buildContextCompressionSummary(
+    conversationHistory.length,
+    effectiveConversationHistory.length,
+    contextCompression
+  );
   const tokenSummaryRows = [
     {
-      detail: "Estimated prompt tokens from the current input.",
+      detail: liveEstimateIsApproximate
+        ? "Approximate prompt tokens from the current input. The server may add summary tokens that are not restored to the client."
+        : "Estimated prompt tokens from the current input.",
       metric: "Current request",
       value: formatTokenCount(liveTokenBudget.currentRequestTokens)
     },
     {
-      detail: "Estimated tokens already carried from earlier user and assistant turns.",
-      metric: "History",
+      detail: liveEstimateIsApproximate
+        ? "Approximate tokens for the effective context currently available on the client. Server-side summary may add more."
+        : "Estimated tokens already carried from the effective context that will be sent to the model.",
+      metric: "Effective history",
       value: formatTokenCount(liveTokenBudget.historyTokens)
     },
     {
-      detail: `Current estimate for the next prompt. Last actual: ${formatNullableTokenCount(latestPromptActualTokens)}.`,
+      detail: `${liveEstimateIsApproximate ? "Approximate" : "Current"} estimate for the next prompt. Last actual: ${formatNullableTokenCount(latestPromptActualTokens)}.`,
       metric: "Next total",
       value: formatTokenCount(liveTokenBudget.promptTokensEstimated)
     },
@@ -232,12 +282,7 @@ export function ChatConsole() {
         });
 
         const payload = (await apiResponse.json().catch(() => null)) as
-          | {
-              conversationId?: string;
-              messages?: ConversationMessage[];
-              error?: string;
-              details?: unknown;
-            }
+          | ConversationRestorePayload
           | null;
 
         if (apiResponse.status === 404) {
@@ -245,6 +290,8 @@ export function ChatConsole() {
             clearPersistedConversationId();
             setActiveConversationId("");
             setConversationHistory([]);
+            setConversationSummary(null);
+            setContextCompression(null);
             setTokenUsage(null);
             setResponse({
               reply: "",
@@ -261,7 +308,13 @@ export function ChatConsole() {
         }
 
         if (!cancelled) {
-          setConversationHistory(payload?.messages ?? []);
+          const nextContext = resolveSavedContextPayload(payload);
+          const nextCompression = nextContext.contextCompression;
+          const nextSummary = nextContext.summary;
+
+          setConversationHistory(trimConversationHistory(payload?.messages ?? [], nextCompression));
+          setConversationSummary(nextSummary);
+          setContextCompression(nextCompression);
           setResponse((current) => ({
             ...current,
             status: "Idle",
@@ -316,6 +369,8 @@ export function ChatConsole() {
     clearPersistedConversationId();
     setActiveConversationId("");
     setConversationHistory([]);
+    setConversationSummary(null);
+    setContextCompression(null);
     lastRestoreAttemptRef.current = "";
     setTokenUsage(null);
     setResponse({
@@ -457,9 +512,15 @@ export function ChatConsole() {
       persistConversationId(payload.conversationId);
     }
 
-    setConversationHistory((current) =>
-      appendConversationTurn(current, submittedPrompt, payload?.reply ?? "")
-    );
+    const nextContext = resolveSavedContextPayload(payload);
+    const nextCompression = nextContext.contextCompression;
+    const nextSummary = nextContext.summary;
+    setConversationSummary(nextSummary);
+    setContextCompression(nextCompression);
+    setConversationHistory((current) => {
+      const nextHistory = appendConversationTurn(current, submittedPrompt, payload?.reply ?? "");
+      return trimConversationHistory(nextHistory, nextCompression);
+    });
     setTokenUsage(resolveTokenUsage(payload?.tokenUsage, payload?.usage, payload?.reply ?? ""));
     setResponse({
       reply: payload?.reply ?? "",
@@ -489,6 +550,7 @@ export function ChatConsole() {
     const decoder = new TextDecoder();
     let buffer = "";
     let assistantReply = "";
+    let latestContextCompression = contextCompression;
 
     while (true) {
       const { done, value } = await reader.read();
@@ -504,6 +566,18 @@ export function ChatConsole() {
           },
           (conversationId) => {
             persistConversationId(conversationId);
+          },
+          (nextCompression, nextSummary) => {
+            if (nextCompression !== null) {
+              latestContextCompression = nextCompression;
+              setContextCompression(nextCompression);
+              if (nextCompression.summaryPresent === false) {
+                setConversationSummary(null);
+              }
+            }
+            if (nextSummary !== null) {
+              setConversationSummary(nextSummary);
+            }
           }
         );
         break;
@@ -525,14 +599,27 @@ export function ChatConsole() {
           },
           (conversationId) => {
             persistConversationId(conversationId);
+          },
+          (nextCompression, nextSummary) => {
+            if (nextCompression !== null) {
+              latestContextCompression = nextCompression;
+              setContextCompression(nextCompression);
+              if (nextCompression.summaryPresent === false) {
+                setConversationSummary(null);
+              }
+            }
+            if (nextSummary !== null) {
+              setConversationSummary(nextSummary);
+            }
           }
         );
       }
     }
 
-    setConversationHistory((current) =>
-      appendConversationTurn(current, submittedPrompt, assistantReply)
-    );
+    setConversationHistory((current) => {
+      const nextHistory = appendConversationTurn(current, submittedPrompt, assistantReply);
+      return trimConversationHistory(nextHistory, latestContextCompression);
+    });
   }
 
   return (
@@ -743,19 +830,20 @@ export function ChatConsole() {
               </button>
               <div className="action-support">
                 <small className="field-hint action-summary">
-                  Context: {conversationHistory.length} saved messages.
+                  {contextCompressionSummary}
                 </small>
                 <button
                   className="secondary-action subtle-action"
                   type="button"
                   onClick={handleClearContext}
-                  disabled={loading || restoringConversation || conversationHistory.length === 0}
+                  disabled={loading || restoringConversation || !activeConversationId}
                 >
                   Clear context
                 </button>
               </div>
               <small className="field-hint action-note">
-                Clears saved history only. Request estimates are shown below.
+                Clears the saved conversation. When compression is active, older turns may already
+                be condensed into a server-side summary.
               </small>
             </div>
           </div>
@@ -796,6 +884,9 @@ export function ChatConsole() {
             <p className="field-hint output-meta token-footer">
               Conversation ID: <code>{activeConversationId}</code>
             </p>
+          ) : null}
+          {contextCompression?.enabled ? (
+            <p className="field-hint output-meta token-footer">{contextCompressionSummary}</p>
           ) : null}
           <div className="output-content">{buildOutputText(response, restoringConversation)}</div>
           {response.error ? <p className="error">{response.error}</p> : null}
@@ -891,7 +982,11 @@ function applyParsedSseEvent(
   setResponse: Dispatch<SetStateAction<ResponseState>>,
   onDelta?: (content: string) => void,
   onTokenUsage?: (tokenUsage: TokenUsage) => void,
-  onConversationId?: (conversationId: string) => void
+  onConversationId?: (conversationId: string) => void,
+  onContextCompression?: (
+    contextCompression: ContextCompressionMeta | null,
+    summary: string | null
+  ) => void
 ) {
   const parsed = parseSseEvent(eventChunk);
   if (!parsed) {
@@ -907,6 +1002,11 @@ function applyParsedSseEvent(
       ...current,
       meta: parsed.data.model ? `Model: ${parsed.data.model}` : current.meta
     }));
+
+    const context = resolveEventContext(parsed.data, "used");
+    if (context.contextCompression !== null || context.summary !== null) {
+      onContextCompression?.(context.contextCompression, context.summary);
+    }
 
     const tokenUsage = extractTokenUsage(parsed.data.tokenUsage);
     if (tokenUsage) {
@@ -928,6 +1028,11 @@ function applyParsedSseEvent(
       extractTokenUsage(parsed.data.tokenUsage)
       ?? resolveTokenUsage(undefined, parsed.data.usage, "");
 
+    const context = resolveEventContext(parsed.data, "saved");
+    if (context.contextCompression !== null || context.summary !== null) {
+      onContextCompression?.(context.contextCompression, context.summary);
+    }
+
     if (tokenUsage) {
       onTokenUsage?.(tokenUsage);
     }
@@ -940,6 +1045,11 @@ function applyParsedSseEvent(
   }
 
   if (parsed.event === "done") {
+    const context = resolveEventContext(parsed.data, "saved");
+    if (context.contextCompression !== null || context.summary !== null) {
+      onContextCompression?.(context.contextCompression, context.summary);
+    }
+
     setResponse((current) => ({
       ...current,
       status: "Completed"
@@ -952,7 +1062,11 @@ function flushClientSseBuffer(
   setResponse: Dispatch<SetStateAction<ResponseState>>,
   onDelta?: (content: string) => void,
   onTokenUsage?: (tokenUsage: TokenUsage) => void,
-  onConversationId?: (conversationId: string) => void
+  onConversationId?: (conversationId: string) => void,
+  onContextCompression?: (
+    contextCompression: ContextCompressionMeta | null,
+    summary: string | null
+  ) => void
 ) {
   const trimmedBuffer = buffer.trim();
   if (!trimmedBuffer) {
@@ -960,7 +1074,14 @@ function flushClientSseBuffer(
   }
 
   for (const eventChunk of splitClientSseEvents(trimmedBuffer)) {
-    applyParsedSseEvent(eventChunk, setResponse, onDelta, onTokenUsage, onConversationId);
+    applyParsedSseEvent(
+      eventChunk,
+      setResponse,
+      onDelta,
+      onTokenUsage,
+      onConversationId,
+      onContextCompression
+    );
   }
 }
 
@@ -1092,6 +1213,7 @@ function estimateLiveTokenBudget(input: {
   responseFormat: string;
   responseLength: string;
   selectedModelMaxTokens: number;
+  summary: string | null;
   stopSequence: string;
   systemPrompt: string;
 }) {
@@ -1104,6 +1226,9 @@ function estimateLiveTokenBudget(input: {
   });
   const messages: Array<ConversationMessage | { role: "system"; content: string }> = [
     ...(systemInstruction ? [{ role: "system" as const, content: systemInstruction }] : []),
+    ...(input.summary
+      ? [{ role: "assistant" as const, content: formatSummaryForEstimate(input.summary) }]
+      : []),
     ...input.conversationHistory,
     { role: "user", content: input.prompt }
   ];
@@ -1173,6 +1298,10 @@ function buildSystemInstructionPreview(input: {
   ].filter((instruction): instruction is string => Boolean(instruction));
 
   return instructions.length > 0 ? instructions.join("\n\n") : undefined;
+}
+
+function formatSummaryForEstimate(summary: string) {
+  return `Conversation summary of earlier turns:\n${summary}`;
 }
 
 function estimateMessageTokens(role: "assistant" | "system" | "user", content: string) {
@@ -1309,4 +1438,180 @@ function buildGuardrailInlineSummary(tokenUsage: TokenUsage) {
   }
 
   return `${reasons.map(formatGuardrailReason).join(" ")} History share: ${historyShare}%.`;
+}
+
+function readOptionalCount(value: unknown) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    return null;
+  }
+
+  return Math.round(value);
+}
+
+function readOptionalBoolean(value: unknown) {
+  return typeof value === "boolean" ? value : null;
+}
+
+function extractContextSnapshot(value: unknown) {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const record = value as Record<string, unknown>;
+  const contextCompression = extractContextCompression(record.contextCompression);
+  const summary = normalizeConversationSummary(record.summary);
+
+  if (contextCompression === null && summary === null) {
+    return null;
+  }
+
+  return {
+    contextCompression,
+    summary
+  };
+}
+
+function extractLegacyContext(value: Record<string, unknown>) {
+  const contextCompression = extractContextCompression(value.contextCompression);
+  const summary = normalizeConversationSummary(value.summary);
+
+  if (contextCompression === null && summary === null) {
+    return null;
+  }
+
+  return {
+    contextCompression,
+    summary
+  };
+}
+
+function resolveSavedContextPayload(
+  value:
+    | {
+        contextCompression?: ContextCompressionMeta | null;
+        savedContext?: ContextSnapshotPayload | null;
+        summary?: string | null;
+      }
+    | null
+    | undefined
+) {
+  const snapshot = extractContextSnapshot(value?.savedContext) ?? extractLegacyContext((value ?? {}) as Record<string, unknown>);
+
+  return {
+    contextCompression: snapshot?.contextCompression ?? null,
+    summary: snapshot?.summary ?? null
+  };
+}
+
+function resolveEventContext(
+  value: Record<string, unknown>,
+  preference: "saved" | "used"
+) {
+  const preferredSnapshot =
+    preference === "saved"
+      ? extractContextSnapshot(value.savedContext)
+      : extractContextSnapshot(value.usedContext);
+  const alternateSnapshot =
+    preference === "saved"
+      ? extractContextSnapshot(value.usedContext)
+      : extractContextSnapshot(value.savedContext);
+  const legacySnapshot = extractLegacyContext(value);
+  const snapshot = preferredSnapshot ?? alternateSnapshot ?? legacySnapshot;
+
+  return {
+    contextCompression: snapshot?.contextCompression ?? null,
+    summary: snapshot?.summary ?? null
+  };
+}
+
+function extractContextCompression(value: unknown): ContextCompressionMeta | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const record = value as Record<string, unknown>;
+  const enabled = readOptionalBoolean(record.enabled);
+  const summaryPresent = readOptionalBoolean(record.summaryPresent);
+  const estimateIsApproximate = readOptionalBoolean(record.estimateIsApproximate);
+  const retainedMessages = readOptionalCount(record.retainedMessages);
+  const compressedMessages = readOptionalCount(record.compressedMessages);
+  const coveredMessageCount = readOptionalCount(record.coveredMessageCount);
+
+  if (
+    enabled === null &&
+    summaryPresent === null &&
+    estimateIsApproximate === null &&
+    retainedMessages === null &&
+    compressedMessages === null &&
+    coveredMessageCount === null
+  ) {
+    return null;
+  }
+
+  return {
+    compressedMessages: compressedMessages ?? undefined,
+    coveredMessageCount: coveredMessageCount ?? undefined,
+    enabled: enabled ?? undefined,
+    estimateIsApproximate: estimateIsApproximate ?? undefined,
+    retainedMessages: retainedMessages ?? undefined,
+    summaryPresent: summaryPresent ?? undefined
+  };
+}
+
+function normalizeConversationSummary(value: unknown) {
+  return typeof value === "string" && value.trim() ? value : null;
+}
+
+function selectEffectiveConversationHistory(
+  history: ConversationMessage[],
+  contextCompression: ContextCompressionMeta | null
+) {
+  const retainedMessages = contextCompression?.retainedMessages;
+
+  if (typeof retainedMessages !== "number" || !Number.isFinite(retainedMessages)) {
+    return history;
+  }
+
+  if (retainedMessages <= 0) {
+    return [];
+  }
+
+  return history.slice(-retainedMessages);
+}
+
+function trimConversationHistory(
+  history: ConversationMessage[],
+  contextCompression: ContextCompressionMeta | null | undefined
+) {
+  return selectEffectiveConversationHistory(history, contextCompression ?? null);
+}
+
+function isApproximateLiveEstimate(
+  contextCompression: ContextCompressionMeta | null,
+  summary: string | null
+) {
+  if (!contextCompression?.enabled) {
+    return false;
+  }
+
+  if (contextCompression.estimateIsApproximate) {
+    return true;
+  }
+
+  return Boolean(contextCompression.summaryPresent && !summary);
+}
+
+function buildContextCompressionSummary(
+  savedMessageCount: number,
+  effectiveMessageCount: number,
+  contextCompression: ContextCompressionMeta | null
+) {
+  if (!contextCompression?.enabled) {
+    return `Context: ${savedMessageCount} saved messages in active use.`;
+  }
+
+  const compressedMessages = contextCompression.compressedMessages ?? 0;
+  const summaryState = contextCompression.summaryPresent ? "summary active" : "summary pending";
+
+  return `Context: ${savedMessageCount} messages restored, ${effectiveMessageCount} kept verbatim, ${compressedMessages} compressed, ${summaryState}.`;
 }

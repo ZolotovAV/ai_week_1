@@ -1,10 +1,23 @@
+import {
+  buildConversationSummaryPrompt,
+  CONTEXT_COMPRESSION_SUMMARY_MAX_TOKENS,
+  formatConversationSummary,
+  normalizeModelSummary
+} from "@/lib/context-compression";
 import type { ServerConfig } from "@/lib/config";
 import { conversationStore, ConversationNotFoundError } from "@/lib/conversation-store";
 import { sseEvent } from "@/lib/http";
 import { resolveRequestedModel } from "@/lib/models";
 import { requestOpenRouter, UpstreamError } from "@/lib/openrouter";
 import { estimateTokenUsage, finalizeTokenUsage, mergeUsage, normalizeUsage } from "@/lib/token-usage";
-import type { ChatMessage, ChatRequest, ConversationMessage, NormalizedUsage } from "@/lib/types";
+import type {
+  ChatMessage,
+  ChatRequest,
+  CompressedConversationContext,
+  ConversationContextSnapshot,
+  ContextCompressionMeta,
+  NormalizedUsage
+} from "@/lib/types";
 
 type OpenRouterMessage = {
   content?: unknown;
@@ -23,9 +36,26 @@ type OpenRouterSuccess = {
 
 type PreparedAgentRequest = {
   conversationId: string;
+  contextCompression: ContextCompressionMeta;
   messages: ChatMessage[];
   requestBody: Record<string, unknown>;
   selectedModel: string;
+  summaryMessageIndices: number[];
+};
+
+type BuiltMessages = {
+  messages: ChatMessage[];
+  summaryMessageIndices: number[];
+};
+
+type SummaryRefreshCandidate = {
+  coveredMessageCount: number;
+  coveredMessageId: number;
+  messages: Array<{
+    content: string;
+    role: "assistant" | "user";
+  }>;
+  previousSummary: string | null;
 };
 
 async function resolveConversationId(requestedConversationId?: string) {
@@ -46,7 +76,7 @@ function prepareRequest(
   config: ServerConfig,
   input: ChatRequest,
   conversationId: string,
-  history: ConversationMessage[],
+  context: CompressedConversationContext,
   stream: boolean
 ): PreparedAgentRequest {
   const selectedModel = resolveRequestedModel(
@@ -54,12 +84,14 @@ function prepareRequest(
     config.allowedModels,
     config.defaultModel
   );
-  const messages = buildMessages(input, history);
+  const { messages, summaryMessageIndices } = buildMessages(input, context);
 
   return {
     conversationId,
+    contextCompression: context.contextCompression,
     messages,
     selectedModel,
+    summaryMessageIndices,
     requestBody: {
       model: selectedModel,
       messages,
@@ -78,21 +110,43 @@ function prepareRequest(
   };
 }
 
-function buildMessages(input: ChatRequest, history: ConversationMessage[]): ChatMessage[] {
+function buildMessages(input: ChatRequest, context: CompressedConversationContext): BuiltMessages {
   const systemInstruction = buildSystemInstruction(input);
-  const conversationMessages: ChatMessage[] = [...history, { role: "user", content: input.prompt }];
+  const summaryMessageIndices: number[] = [];
+  const conversationMessages: ChatMessage[] = [
+    ...(context.effectiveSummary
+      ? [
+          {
+            role: "assistant" as const,
+            content: formatConversationSummary(context.effectiveSummary)
+          }
+        ]
+      : []),
+    ...context.tailMessages,
+    { role: "user", content: input.prompt }
+  ];
 
-  if (!systemInstruction) {
-    return conversationMessages;
+  if (context.effectiveSummary) {
+    summaryMessageIndices.push(systemInstruction ? 1 : 0);
   }
 
-  return [
-    {
-      role: "system",
-      content: systemInstruction
-    },
-    ...conversationMessages
-  ];
+  if (!systemInstruction) {
+    return {
+      messages: conversationMessages,
+      summaryMessageIndices
+    };
+  }
+
+  return {
+    messages: [
+      {
+        role: "system",
+        content: systemInstruction
+      },
+      ...conversationMessages
+    ],
+    summaryMessageIndices
+  };
 }
 
 function buildSystemInstruction(input: ChatRequest) {
@@ -119,6 +173,66 @@ function buildSystemInstruction(input: ChatRequest) {
   }
 
   return instructions.join("\n\n");
+}
+
+async function requestConversationSummary(
+  config: ServerConfig,
+  candidate: SummaryRefreshCandidate
+) {
+  const response = await requestOpenRouter(config, {
+    model: config.summaryModel,
+    messages: [
+      {
+        role: "system",
+        content:
+          "You maintain a concise, factual memory summary for a conversation. Return plain text only."
+      },
+      {
+        role: "user",
+        content: buildConversationSummaryPrompt(candidate.previousSummary, candidate.messages)
+      }
+    ],
+    stream: false,
+    temperature: 0,
+    max_tokens: CONTEXT_COMPRESSION_SUMMARY_MAX_TOKENS
+  });
+  const payload = (await response.json()) as OpenRouterSuccess;
+  const reply = normalizeContent(payload.choices?.[0]?.message?.content);
+
+  return normalizeModelSummary(reply);
+}
+
+async function refreshConversationSummaryWithModel(config: ServerConfig, conversationId: string) {
+  const candidate = (await conversationStore.getSummaryRefreshCandidate(
+    conversationId
+  )) as SummaryRefreshCandidate | null;
+
+  if (!candidate) {
+    return;
+  }
+
+  const summary = await requestConversationSummary(config, candidate);
+  if (!summary) {
+    return;
+  }
+
+  await conversationStore.saveConversationSummary(
+    conversationId,
+    summary,
+    candidate.coveredMessageId,
+    candidate.coveredMessageCount
+  );
+}
+
+async function syncConversationSummary(config: ServerConfig, conversationId: string) {
+  try {
+    await refreshConversationSummaryWithModel(config, conversationId);
+  } catch (error) {
+    console.error("Conversation summary refresh failed", {
+      conversationId,
+      error: error instanceof Error ? error.message : "Unknown summary refresh error."
+    });
+  }
 }
 
 function normalizeContent(content: unknown): string {
@@ -288,25 +402,56 @@ function flushBufferedEvents(buffer: string) {
   };
 }
 
+function withContextCompression<T extends Record<string, unknown>>(
+  payload: T,
+  usedContext: ConversationContextSnapshot,
+  savedContext: ConversationContextSnapshot
+) {
+  return {
+    ...payload,
+    contextCompression: savedContext.contextCompression,
+    summary: savedContext.summary,
+    savedContext,
+    usedContext
+  };
+}
+
+function toContextSnapshot(context: CompressedConversationContext): ConversationContextSnapshot {
+  return {
+    contextCompression: context.contextCompression,
+    summary: context.effectiveSummary
+  };
+}
+
 export const chatAgent = {
   async respond(config: ServerConfig, input: ChatRequest) {
     const conversationId = await resolveConversationId(input.conversationId);
-    const history = await conversationStore.getConversationMessages(conversationId);
+    await syncConversationSummary(config, conversationId);
+    const context = await conversationStore.getCompressedContext(conversationId);
+    const usedContext = toContextSnapshot(context);
 
     await conversationStore.appendMessage(conversationId, "user", input.prompt);
 
-    const { messages, requestBody, selectedModel } = prepareRequest(
+    const {
+      contextCompression,
+      messages,
+      requestBody,
+      selectedModel,
+      summaryMessageIndices
+    } = prepareRequest(
       config,
       input,
       conversationId,
-      history,
+      context,
       false
     );
     const estimatedTokenUsage = estimateTokenUsage({
+      contextCompression,
       messages,
       model: selectedModel,
       modelContextWindows: config.modelContextWindows,
-      requestedMaxTokens: input.maxTokens
+      requestedMaxTokens: input.maxTokens,
+      summaryMessageIndices
     });
     const response = await requestOpenRouter(config, requestBody);
     const payload = (await response.json()) as OpenRouterSuccess;
@@ -316,38 +461,57 @@ export const chatAgent = {
 
     if (reply.trim()) {
       await conversationStore.appendMessage(conversationId, "assistant", reply);
+      await syncConversationSummary(config, conversationId);
     }
 
-    return {
-      conversationId,
-      id: payload.id ?? null,
-      model: payload.model ?? null,
-      provider: payload.provider ?? "openrouter",
-      usage: payload.usage ?? null,
-      tokenUsage,
-      reply,
-      reasoning: input.reasoning?.enabled ? extractReasoning(message) : undefined
-    };
+    const savedContext = toContextSnapshot(
+      await conversationStore.getCompressedContext(conversationId)
+    );
+
+    return withContextCompression(
+      {
+        conversationId,
+        id: payload.id ?? null,
+        model: payload.model ?? null,
+        provider: payload.provider ?? "openrouter",
+        usage: payload.usage ?? null,
+        tokenUsage,
+        reply,
+        reasoning: input.reasoning?.enabled ? extractReasoning(message) : undefined
+      },
+      usedContext,
+      savedContext
+    );
   },
 
   async stream(config: ServerConfig, input: ChatRequest) {
     const conversationId = await resolveConversationId(input.conversationId);
-    const history = await conversationStore.getConversationMessages(conversationId);
+    await syncConversationSummary(config, conversationId);
+    const context = await conversationStore.getCompressedContext(conversationId);
+    const usedContext = toContextSnapshot(context);
 
     await conversationStore.appendMessage(conversationId, "user", input.prompt);
 
-    const { messages, requestBody, selectedModel } = prepareRequest(
+    const {
+      contextCompression,
+      messages,
+      requestBody,
+      selectedModel,
+      summaryMessageIndices
+    } = prepareRequest(
       config,
       input,
       conversationId,
-      history,
+      context,
       true
     );
     const estimatedTokenUsage = estimateTokenUsage({
+      contextCompression,
       messages,
       model: selectedModel,
       modelContextWindows: config.modelContextWindows,
-      requestedMaxTokens: input.maxTokens
+      requestedMaxTokens: input.maxTokens,
+      summaryMessageIndices
     });
     const upstreamResponse = await requestOpenRouter(config, requestBody);
 
@@ -369,6 +533,7 @@ export const chatAgent = {
 
       assistantReplySaved = true;
       await conversationStore.appendMessage(conversationId, "assistant", assistantReply);
+      await syncConversationSummary(config, conversationId);
     };
 
     const stream = new ReadableStream<Uint8Array>({
@@ -379,6 +544,9 @@ export const chatAgent = {
               conversationId,
               model: selectedModel,
               provider: "openrouter",
+              contextCompression: usedContext.contextCompression,
+              summary: usedContext.summary,
+              usedContext,
               tokenUsage: estimatedTokenUsage
             })
           )
@@ -409,6 +577,9 @@ export const chatAgent = {
                 controller.enqueue(
                   encoder.encode(
                     sseEvent("usage", {
+                      contextCompression: usedContext.contextCompression,
+                      summary: usedContext.summary,
+                      usedContext,
                       usage: latestUsage,
                       tokenUsage: finalizeTokenUsage(
                         estimatedTokenUsage,
@@ -438,6 +609,9 @@ export const chatAgent = {
                 controller.enqueue(
                   encoder.encode(
                     sseEvent("usage", {
+                      contextCompression: usedContext.contextCompression,
+                      summary: usedContext.summary,
+                      usedContext,
                       usage: latestUsage,
                       tokenUsage: finalizeTokenUsage(
                         estimatedTokenUsage,
@@ -451,7 +625,34 @@ export const chatAgent = {
 
               if (parsed.done) {
                 await persistAssistantReply();
-                controller.enqueue(encoder.encode(sseEvent("done", { done: true })));
+                const savedContext = toContextSnapshot(
+                  await conversationStore.getCompressedContext(conversationId)
+                );
+                controller.enqueue(
+                  encoder.encode(
+                    sseEvent("usage", {
+                      contextCompression: savedContext.contextCompression,
+                      savedContext,
+                      summary: savedContext.summary,
+                      usage: latestUsage,
+                      tokenUsage: finalizeTokenUsage(
+                        estimatedTokenUsage,
+                        latestUsage,
+                        assistantReply
+                      )
+                    })
+                  )
+                );
+                controller.enqueue(
+                  encoder.encode(
+                    sseEvent("done", {
+                      contextCompression: savedContext.contextCompression,
+                      done: true,
+                      savedContext,
+                      summary: savedContext.summary
+                    })
+                  )
+                );
                 controller.close();
                 return;
               }
@@ -464,15 +665,30 @@ export const chatAgent = {
           }
 
           await persistAssistantReply();
+          const savedContext = toContextSnapshot(
+            await conversationStore.getCompressedContext(conversationId)
+          );
           controller.enqueue(
             encoder.encode(
               sseEvent("usage", {
+                contextCompression: savedContext.contextCompression,
+                savedContext,
+                summary: savedContext.summary,
                 usage: latestUsage,
                 tokenUsage: finalizeTokenUsage(estimatedTokenUsage, latestUsage, assistantReply)
               })
             )
           );
-          controller.enqueue(encoder.encode(sseEvent("done", { done: true })));
+          controller.enqueue(
+            encoder.encode(
+              sseEvent("done", {
+                contextCompression: savedContext.contextCompression,
+                done: true,
+                savedContext,
+                summary: savedContext.summary
+              })
+            )
+          );
           controller.close();
         } catch (error) {
           const message = error instanceof Error ? error.message : "Streaming pipeline failed.";

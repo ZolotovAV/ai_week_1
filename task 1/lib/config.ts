@@ -4,6 +4,7 @@ export type ServerConfig = {
   openRouterApiKey: string;
   serviceApiKey: string;
   defaultModel: string;
+  summaryModel: string;
   allowedModels: string[];
   modelContextWindows: Record<string, number>;
   httpReferer?: string;
@@ -53,11 +54,13 @@ export function getServerConfig(): ServerConfig {
 
   const defaultModel =
     process.env.OPENROUTER_MODEL?.trim() || "nvidia/nemotron-3-super-120b-a12b:free";
+  const summaryModel = process.env.OPENROUTER_SUMMARY_MODEL?.trim() || defaultModel;
 
   return {
     openRouterApiKey,
     serviceApiKey,
     defaultModel,
+    summaryModel,
     allowedModels: parseAllowedModels(defaultModel, process.env.OPENROUTER_ALLOWED_MODELS),
     modelContextWindows: parseModelContextWindows(process.env.OPENROUTER_MODEL_CONTEXT_WINDOWS),
     httpReferer: process.env.OPENROUTER_HTTP_REFERER?.trim(),

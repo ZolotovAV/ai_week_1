@@ -1,5 +1,6 @@
 import type {
   ChatMessage,
+  ContextCompressionMeta,
   NormalizedUsage,
   TokenGuardrailReason,
   TokenGuardrailStatus,
@@ -15,6 +16,8 @@ type EstimateTokenUsageInput = {
   model: string;
   modelContextWindows: Record<string, number>;
   requestedMaxTokens?: number;
+  summaryMessageIndices?: number[];
+  contextCompression?: ContextCompressionMeta;
 };
 
 function clampRatio(value: number) {
@@ -29,7 +32,7 @@ function clampRatio(value: number) {
   return value;
 }
 
-function estimateTextTokens(text: string) {
+export function estimateTextTokens(text: string) {
   const normalized = text.trim();
   if (!normalized) {
     return 0;
@@ -49,8 +52,12 @@ function estimateTextTokens(text: string) {
   }, 0);
 }
 
+export function estimateMessageTokensForRole(role: ChatMessage["role"], content: string) {
+  return MESSAGE_OVERHEAD_TOKENS + estimateTextTokens(role) + estimateTextTokens(content);
+}
+
 function estimateMessageTokens(message: ChatMessage) {
-  return MESSAGE_OVERHEAD_TOKENS + estimateTextTokens(message.role) + estimateTextTokens(message.content);
+  return estimateMessageTokensForRole(message.role, message.content);
 }
 
 function toFiniteTokenCount(value: unknown) {
@@ -165,9 +172,12 @@ export function estimateTokenUsage({
   messages,
   model,
   modelContextWindows,
-  requestedMaxTokens
+  requestedMaxTokens,
+  summaryMessageIndices = [],
+  contextCompression
 }: EstimateTokenUsageInput): TokenUsage {
   const contextWindow = resolveModelContextWindow(model, modelContextWindows);
+  const summaryMessageIndexSet = new Set(summaryMessageIndices);
   let lastUserMessageIndex = -1;
 
   for (let index = messages.length - 1; index >= 0; index -= 1) {
@@ -179,6 +189,8 @@ export function estimateTokenUsage({
 
   let currentRequestTokens = 0;
   let historyTokens = 0;
+  let historySummaryTokens = 0;
+  let historyTailTokens = 0;
   let systemTokens = 0;
 
   for (const [index, message] of messages.entries()) {
@@ -191,6 +203,11 @@ export function estimateTokenUsage({
 
     if (message.role === "assistant") {
       historyTokens += estimatedTokens;
+      if (summaryMessageIndexSet.has(index)) {
+        historySummaryTokens += estimatedTokens;
+      } else {
+        historyTailTokens += estimatedTokens;
+      }
       continue;
     }
 
@@ -200,6 +217,7 @@ export function estimateTokenUsage({
     }
 
     historyTokens += estimatedTokens;
+    historyTailTokens += estimatedTokens;
   }
 
   const promptEstimated = currentRequestTokens + historyTokens + systemTokens + REPLY_OVERHEAD_TOKENS;
@@ -221,7 +239,13 @@ export function estimateTokenUsage({
         estimated: currentRequestTokens
       },
       history: {
-        estimated: historyTokens
+        estimated: historyTokens,
+        summary: {
+          estimated: historySummaryTokens
+        },
+        tail: {
+          estimated: historyTailTokens
+        }
       },
       system: {
         estimated: systemTokens
@@ -247,7 +271,8 @@ export function estimateTokenUsage({
       historyShare: guardrail.historyShare,
       contextWindow,
       estimatedContextUsageRatio: guardrail.estimatedContextUsageRatio
-    }
+    },
+    contextCompression
   };
 }
 

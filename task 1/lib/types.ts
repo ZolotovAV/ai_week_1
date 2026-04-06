@@ -43,6 +43,34 @@ export type ChatMessage = z.infer<typeof chatMessageSchema>;
 export type ConversationMessage = z.infer<typeof conversationMessageSchema>;
 export type ChatRequest = z.infer<typeof chatRequestBaseSchema>;
 
+export type ConversationSummary = {
+  summary: string;
+  coveredMessageCount: number;
+  coveredMessageId: number;
+  updatedAt: string;
+};
+
+export type ContextCompressionMeta = {
+  enabled: boolean;
+  summaryPresent: boolean;
+  retainedMessages: number;
+  compressedMessages: number;
+  coveredMessageCount: number;
+  summaryEstimatedTokens?: number;
+};
+
+export type CompressedConversationContext = {
+  effectiveSummary: string | null;
+  summary: ConversationSummary | null;
+  tailMessages: ConversationMessage[];
+  contextCompression: ContextCompressionMeta;
+};
+
+export type ConversationContextSnapshot = {
+  contextCompression: ContextCompressionMeta;
+  summary: string | null;
+};
+
 export type TokenGuardrailStatus = "ok" | "warning" | "near_limit";
 
 export type TokenGuardrailReason =
@@ -64,6 +92,12 @@ export type TokenUsage = {
     };
     history: {
       estimated: number;
+      summary?: {
+        estimated: number;
+      };
+      tail?: {
+        estimated: number;
+      };
     };
     system: {
       estimated: number;
@@ -90,4 +124,5 @@ export type TokenUsage = {
     contextWindow: number;
     estimatedContextUsageRatio: number;
   };
+  contextCompression?: ContextCompressionMeta;
 };
